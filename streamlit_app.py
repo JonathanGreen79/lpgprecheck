@@ -40,27 +40,39 @@ def is_authed() -> bool:
 def sidebar_secrets_status():
     def tick(flag: bool) -> str:
         return "✅" if flag else "⚠️"
-    st.sidebar.markdown("#### Secrets status")
-    st.sidebar.write(f"{tick(bool(W3W_API_KEY))} what3words API key")
-    st.sidebar.write(f"{tick(bool(MAPBOX_TOKEN))} Mapbox token")
-    st.sidebar.write(f"{tick(bool(OPENAI_API_KEY))} OpenAI key (optional)")
-    st.sidebar.write(f"{tick(bool(APP_PASSWORD))} App password")
+    st.sidebar.markdown("#### API and Tokens")
+    st.sidebar.write(f"{tick(bool(W3W_API_KEY))} what3words API )
+    st.sidebar.write(f"{tick(bool(MAPBOX_TOKEN))} Mapbox Token")
+    st.sidebar.write(f"{tick(bool(OPENAI_API_KEY))} OpenAI Key")
+    st.sidebar.write(f"{tick(bool(APP_PASSWORD))} App Password")
 
 def sidebar_access():
     st.sidebar.markdown("#### Access")
-    if APP_PASSWORD:
-        if is_authed():
-            st.sidebar.success("🔓 Access authenticated")
-            return
-        pw = st.sidebar.text_input("Password", type="password", key="__pw_input__")
-        if st.sidebar.button("Unlock", key="__unlock_btn__"):
-            st.session_state["__auth_ok__"] = (pw == APP_PASSWORD)
-            if not st.session_state["__auth_ok__"]:
-                st.sidebar.error("Incorrect password")
-        if not is_authed():
-            st.sidebar.info("Enter the password to continue.")
-    else:
+    if not APP_PASSWORD:
         st.sidebar.warning("No APP_PASSWORD set — access is open.")
+        return
+
+    # PW input (pressing Enter will also try to unlock)
+    def _try_unlock():
+        st.session_state["__auth_ok__"] = (st.session_state.get("__pw_input__", "") == APP_PASSWORD)
+
+    pw = st.sidebar.text_input(
+        "Password",
+        type="password",
+        key="__pw_input__",
+        on_change=_try_unlock,  # unlock on Enter
+    )
+
+    # Button also tries to unlock
+    if st.sidebar.button("Unlock", key="__unlock_btn__"):
+        _try_unlock()
+
+    # NOW check auth *after* we may have updated it this run
+    if bool(st.session_state.get("__auth_ok__", False)):
+        st.sidebar.success("🔓 Access authenticated")
+    else:
+        st.sidebar.info("Enter the password to continue.")
+
 
 # ------------------------- Vehicle presets -------------------------
 VEHICLE_PRESETS = {
@@ -917,3 +929,4 @@ if auto:
                 )
             else:
                 st.caption("PDF generation unavailable on this host (ReportLab not installed).")
+
