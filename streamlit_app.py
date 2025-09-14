@@ -27,13 +27,11 @@ OPENAI_API_KEY = get_secret("OPENAI_API_KEY")  # not used in this offline build
 MAPBOX_TOKEN   = get_secret("MAPBOX_TOKEN")
 APP_PASSWORD   = get_secret("APP_PASSWORD", "")  # <-- password lives with your API keys
 
-UA = {"User-Agent": "LPG-Precheck/1.6"}
+UA = {"User-Agent": "LPG-Precheck/1.7"}
 
 # ------------------------- Auth + status helpers -------------------------
 def is_authed() -> bool:
-    # Require a password if provided in secrets/env
     if not APP_PASSWORD:
-        # If no password was set at all, treat as locked open (but show sidebar warning).
         return True
     return bool(st.session_state.get("__auth_ok__", False))
 
@@ -52,17 +50,15 @@ def sidebar_access():
         st.sidebar.warning("No APP_PASSWORD set — access is open.")
         return
 
-    # If already authenticated, show message and stop rendering the input
+    # Already authed? show status and exit
     if st.session_state.get("__auth_ok__", False):
         st.sidebar.success("🔓 Access authenticated")
         return
 
-    # Otherwise, show the password input + unlock button
     def _try_unlock():
         ok = (st.session_state.get("__pw_input__", "") == APP_PASSWORD)
         st.session_state["__auth_ok__"] = ok
         if ok:
-            # clear the typed password and re-run so the input disappears immediately
             st.session_state["__pw_input__"] = ""
             st.rerun()
 
@@ -70,16 +66,13 @@ def sidebar_access():
         "Password",
         type="password",
         key="__pw_input__",
-        on_change=_try_unlock,  # pressing Enter unlocks too
+        on_change=_try_unlock,
     )
     if st.sidebar.button("Unlock", key="__unlock_btn__"):
         _try_unlock()
 
-    # If still not authed after attempts, nudge the user
     if not st.session_state.get("__auth_ok__", False):
         st.sidebar.info("Enter the password to continue.")
-
-
 
 # ------------------------- Vehicle presets -------------------------
 VEHICLE_PRESETS = {
@@ -168,6 +161,8 @@ def reverse_geocode(lat, lon) -> Dict:
         pass
     return {}
 
+OVERPASS = "https://overpass-api.de/api/interpreter"
+
 def open_meteo(lat, lon) -> Dict:
     try:
         r = requests.get(
@@ -186,8 +181,6 @@ def open_meteo(lat, lon) -> Dict:
     except Exception:
         pass
     return {"speed_mps": None, "deg": None, "compass": None}
-
-OVERPASS = "https://overpass-api.de/api/interpreter"
 
 def overpass_near(lat, lon, radius=400) -> Dict:
     q = f"""
@@ -215,6 +208,56 @@ out tags geom;
         return r.json()
     except Exception:
         return {"elements": []}
+
+# ---- NEW: nearest hospital with escalating radius
+def nearest_hospital(lat: float, lon: float) -> Dict:
+    """Return nearest hospital-like feature up to 10 km."""
+    radii = [400, 1000, 3000, 10000]
+    best = None
+    def centroid(coords):
+        if not coords: return (lat, lon)
+        xs = sum(c[0] for c in coords) / len(coords)
+        ys = sum(c[1] for c in coords) / len(coords)
+        return xs, ys
+    for r in radii:
+        q = f"""
+[out:json][timeout:60];
+(
+  node(around:{r},{lat},{lon})["amenity"="hospital"];
+  node(around:{r},{lat},{lon})["healthcare"="hospital"];
+  way(around:{r},{lat},{lon})["amenity"="hospital"];
+  way(around:{r},{lat},{lon})["healthcare"="hospital"];
+  relation(around:{r},{lat},{lon})["amenity"="hospital"];
+  relation(around:{r},{lat},{lon})["healthcare"="hospital"];
+);
+out tags geom 20;
+"""
+        try:
+            resp = requests.post(OVERPASS, data={"data": q}, headers=UA, timeout=90)
+            resp.raise_for_status()
+            data = resp.json().get("elements", [])
+        except Exception:
+            data = []
+        for el in data:
+            tags = el.get("tags", {}) or {}
+            name = tags.get("name") or tags.get("official_name")
+            if el.get("type") == "node":
+                la, lo = el.get("lat"), el.get("lon")
+            else:
+                geom = el.get("geometry") or []
+                if not geom: 
+                    continue
+                la, lo = centroid([(g["lat"], g["lon"]) for g in geom])
+            d = _dist_m(lat, lon, la, lo)
+            if best is None or d < best["distance_m"]:
+                best = {
+                    "name": name or "Nearest hospital",
+                    "distance_m": round(d, 1),
+                    "lat": la, "lon": lo,
+                }
+        if best:
+            break
+    return best or {"name": "n/a", "distance_m": None, "lat": None, "lon": None}
 
 def parse_osm(lat0, lon0, data) -> Dict:
     bpolys, roads, drains, manholes, plines, pnodes, rails, wlines, wpolys, land_polys = [],[],[],[],[],[],[],[],[],[]
@@ -419,25 +462,12 @@ def ai_sections(ctx: Dict) -> Dict[str, str]:
     }
 
 # ------------------------- UI helper: seeded, editable distance -------------------------
-def nm_distance(
-    label: str,
-    key: str,
-    auto_val: Optional[float],
-    max_val: float = 2000.0,
-    seed_tag: Optional[str] = None,
-) -> Optional[float]:
-    """
-    - Always editable number input (works inside st.form)
-    - Auto-seeds from current W3W (seed_tag) so boxes show fetched values
-    - Returns None when 'Not mapped' is ticked
-    """
+def nm_distance(label: str, key: str, auto_val: Optional[float], max_val: float = 2000.0, seed_tag: Optional[str] = None) -> Optional[float]:
     tag = seed_tag or "__default__"
-
     if st.session_state.get(f"{key}__seed") != tag:
         st.session_state[f"{key}__nm"]  = (auto_val is None)
         st.session_state[f"{key}__val"] = 0.0 if auto_val is None else float(auto_val)
         st.session_state[f"{key}__seed"] = tag
-
     c1, c2 = st.columns([0.78, 0.22])
     with c1:
         val = st.number_input(
@@ -448,20 +478,17 @@ def nm_distance(
         )
     with c2:
         nm = st.checkbox("Not mapped", value=st.session_state[f"{key}__nm"], key=f"{key}__nm_chk")
-
     st.session_state[f"{key}__val"] = val
     st.session_state[f"{key}__nm"]  = nm
-
     return None if nm else float(val)
 
 # ------------------------- Pretty key/value block -------------------------
 def kv_block(title: str, data: Dict, cols: int = 2, fmt: Dict[str, str] | None = None):
-    """Pretty key/value block."""
+    """Pretty key/value block (inline compact)."""
     st.markdown(f"### {title}" if title.lower().startswith("key") else f"#### {title}")
     keys = list(data.keys())
     rows = (len(keys) + cols - 1) // cols
     fmt = fmt or {}
-    # normalize values
     def show(k, v):
         if v is None:
             return "—"
@@ -483,6 +510,7 @@ def kv_block(title: str, data: Dict, cols: int = 2, fmt: Dict[str, str] | None =
                         f"<div style='line-height:1.4'><b>{k}:</b> {show(k,v)}</div>",
                         unsafe_allow_html=True,
                     )
+
 # ------------------------- Sidebar (status & access) -------------------------
 sidebar_secrets_status()
 sidebar_access()
@@ -517,7 +545,6 @@ with c_run:
 with c_reset:
     reset = st.button("Reset", type="secondary", use_container_width=True)
 
-# Reset: clear data below and W3W, hide edit/results until new W3W entered
 if reset:
     for k in list(st.session_state.keys()):
         if k.startswith("d_") or k.endswith("__val") or k.endswith("__nm") or k.endswith("__seed") or k.startswith("veh_"):
@@ -529,7 +556,6 @@ if reset:
 w3w_input = st.text_input("what3words (word.word.word):", value=st.session_state.get("w3w", ""))
 
 if run and w3w_input and w3w_input.count(".") == 2:
-    # Clear previous auto so sections hide while spinner shows
     st.session_state.pop("auto", None)
     st.session_state["w3w"] = w3w_input.strip()
     with st.status("Fetching site data…", expanded=False):
@@ -542,14 +568,16 @@ if run and w3w_input and w3w_input.count(".") == 2:
         wind = open_meteo(lat, lon)
         osm  = overpass_near(lat, lon, radius=400)
         feats = parse_osm(lat, lon, osm)
+        hosp = nearest_hospital(lat, lon)
 
         st.session_state["auto"] = {
             "lat": lat, "lon": lon,
             "addr": addr,
+            "hospital": hosp,
             "wind_mps": wind.get("speed_mps") or 0.0,
             "wind_deg": wind.get("deg") or 0,
             "wind_comp": wind.get("compass") or "n/a",
-            "slope_pct": 3.5,      # optional: add elevation service later
+            "slope_pct": 3.5,
             "approach_avg": 0.9,
             "approach_max": 3.5,
             **feats,
@@ -564,6 +592,25 @@ if auto:
 
     st.markdown("### Edit & confirm")
     with st.form("inputs"):
+        # ---------------- Location & address (FIRST) ----------------
+        st.subheader("Location & address")
+        a1, a2 = st.columns([0.6, 0.4])
+        with a1:
+            addr_road = st.text_input("Road / street", auto.get("addr", {}).get("road", ""))
+            addr_city = st.text_input("Town / City", auto.get("addr", {}).get("city", ""))
+            addr_postcode = st.text_input("Postcode", auto.get("addr", {}).get("postcode", ""))
+            addr_local = st.text_input("Local authority", auto.get("addr", {}).get("local_authority", ""))
+            hosp_name = st.text_input("Nearest hospital", (auto.get("hospital", {}) or {}).get("name", ""))
+        with a2:
+            st.text_input("what3words", st.session_state.get("w3w", ""), disabled=True)
+            st.text_input("Latitude", f"{auto.get('lat', '')}", disabled=True)
+            st.text_input("Longitude", f"{auto.get('lon', '')}", disabled=True)
+            hosp_dist = (auto.get("hospital", {}) or {}).get("distance_m", None)
+            hosp_km = f"{(hosp_dist/1000):.2f} km" if isinstance(hosp_dist, (int, float)) else "—"
+            st.text_input("Hospital distance (approx.)", hosp_km, disabled=True)
+        st.markdown("---")
+
+        # ---------------- Environment & approach ----------------
         st.subheader("Environment & approach")
         e1, e2, e3 = st.columns(3)
         with e1:
@@ -629,7 +676,6 @@ if auto:
         tc_col = st.columns(4)[0]
         with tc_col:
             turning_circle_m = st.number_input("Turning circle (m)", 8.0, 30.0, float(st.session_state.get(f"{basekey}_turning_circle_m", preset["turning_circle_m"])), 0.1)
-        # persist per vehicle
         st.session_state[f"{basekey}_length_m"] = veh_length_m
         st.session_state[f"{basekey}_width_m"] = veh_width_m
         st.session_state[f"{basekey}_height_m"] = veh_height_m
@@ -677,6 +723,15 @@ if auto:
             veg_3m=veg_3m, open_field_m=open_field_m
         )
 
+        # pack edited address + hospital for export
+        addr_edited = {
+            "road": addr_road, "city": addr_city, "postcode": addr_postcode,
+            "local_authority": addr_local,
+            "display_name": auto.get("addr", {}).get("display_name", ""),
+            "hospital_name": hosp_name,
+            "hospital_distance_m": (auto.get("hospital", {}) or {}).get("distance_m", None),
+        }
+
         left, right = st.columns([0.45, 0.55])
 
         with left:
@@ -688,9 +743,11 @@ if auto:
                     "Slope (%)": round(slope_pct, 1),
                     "Approach avg/max (%)": f"{approach_avg:.1f} / {approach_max:.1f}",
                     "Flood": "Low — No mapped watercourse nearby" if (water_m is None or water_m >= 150) else "Medium/High",
+                    "Nearest hospital": hosp_name,
+                    "Hospital distance (km)": round(((auto.get("hospital", {}) or {}).get("distance_m", 0.0) or 0.0)/1000.0, 2),
                 },
                 cols=2,
-                fmt={"Wind (m/s)": ".1f", "Slope (%)": ".1f"}
+                fmt={"Wind (m/s)": ".1f", "Slope (%)": ".1f", "Hospital distance (km)": ".2f"}
             )
 
             kv_block(
@@ -839,6 +896,12 @@ if auto:
                 addr_line = ", ".join([p for p in [addr.get("road"), addr.get("city"), addr.get("postcode")] if p])
                 if addr_line: text_line(addr_line, col=grey)
                 if addr.get("display_name"): text_line(addr["display_name"], col=grey)
+                if addr.get("hospital_name"):
+                    if addr.get("hospital_distance_m") is not None:
+                        km = addr["hospital_distance_m"] / 1000.0
+                        text_line(f"Nearest hospital: {addr['hospital_name']} (~{km:.2f} km)", col=grey)
+                    else:
+                        text_line(f"Nearest hospital: {addr['hospital_name']}", col=grey)
 
                 # Map
                 if map_file and os.path.exists(map_file):
@@ -908,7 +971,7 @@ if auto:
                 return buf.getvalue()
 
             ctx_pdf = {
-                "addr": st.session_state["auto"].get("addr", {}),
+                "addr": addr_edited,
                 "wind": wind,
                 "slope_pct": slope_pct,
                 "approach_avg": approach_avg,
@@ -937,8 +1000,3 @@ if auto:
                 )
             else:
                 st.caption("PDF generation unavailable on this host (ReportLab not installed).")
-
-
-
-
-
