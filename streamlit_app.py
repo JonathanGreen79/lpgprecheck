@@ -725,12 +725,12 @@ if auto:
                 "Number of solid sides enclosing tank/stand (fence/walls)",
                 options=[0, 1, 2, 3, 4], value=0, key="enclosure_sides_sel"
             )
-            los_slider = st.select_slider(
+            los_issue = st.toggle(
                 "Restricted line-of-sight at stand",
-                options=["No", "Yes"],
-                value="No",
-                key="los_sel"
+                value=False,
+                key="los_tgl"
             )
+
             los_issue = (los_slider == "Yes")
         with v2:
             stand_surface = st.selectbox(
@@ -1037,3 +1037,4 @@ if auto:
                 )
             else:
                 st.caption("PDF generation unavailable on this host (ReportLab not installed).")
+
