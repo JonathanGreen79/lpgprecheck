@@ -441,30 +441,45 @@ def risk_score(feats, wind, slope, appr, rr, notes, surf, flood, answers=None, c
     return {"score":score,"status":status,"explain":why}
 
 # ─────────────────────────── AI commentary ─────────────────────
-def ai_sections(context: Dict) -> Dict[str,str]:
-    def offline(ctx: Dict) -> Dict[str,str]:
-        feats,wind,slope,appr,rr,flood,risk = (ctx.get(k,{}) for k in
-            ["features","wind","slope","approach","route_ratio","flood","risk"])
-        S1=(f"The local slope is {slope.get('grade_pct','?')}% (aspect {int((slope.get('aspect_deg') or 0))}°). "
-            f"Key separations (m) include: building {feats.get('d_building_m')}, shed/structure {feats.get('d_outbuilding_m')}, "
-            f"boundary {feats.get('d_boundary_m')}, road {feats.get('d_road_m')}, drain {feats.get('d_drain_m')}, "
-            f"overhead power lines {feats.get('d_overhead_m')}, and rail {feats.get('d_rail_m')}. "
-            f"Wind is {(wind.get('speed_mps') or 0):.1f} m/s from {wind.get('compass') or 'n/a'}. "
-            f"Overall heuristic {risk.get('score','?')}/100 → {risk.get('status','?')}. The score is driven by: "
-            + "; ".join(f\"{int(p)} {m}\" for p,m in risk.get(\"explain\",[])[:4]) + ".")
-        S2=(f"Flood risk is {flood.get('level','n/a')} ({'; '.join(flood.get('why',[]))}). "
-            f"No mapped watercourse within the search radius if distance is unset. Drains and manholes should be "
-            f"protected during transfers to avoid subsurface gas migration. Land use is {feats.get('land_class','n/a')}.")
-        S3=(f"Approach gradients average/max {appr.get('avg_pct','?')}/{appr.get('max_pct','?')}%. "
-            + (f"Calculated route indirectness is {rr:.2f}× the crow-fly distance. " if rr else "")
-            + "Validate access restrictions and ensure the tanker stand provides sound hardstanding and clear sightlines.")
-        S4=("Site appears suitable with routine controls." if risk.get('status')=='PASS' else
-            "Attention required: confirm minimum separations to CoP1, control ignition sources, "
-            "protect drainage, and plan safe approach/egress under adverse conditions.")
-        return {"Safety Risk Profile":S1,"Environmental Considerations":S2,"Access & Logistics":S3,"Overall Site Suitability":S4}
+def offline(ctx: Dict) -> Dict[str,str]:
+    feats,wind,slope,appr,rr,flood,risk = (ctx.get(k,{}) for k in
+        ["features","wind","slope","approach","route_ratio","flood","risk"])
 
-    if not OPENAI_API_KEY:
-        return offline(context)
+    S1 = (
+        f"The local slope is {slope.get('grade_pct','?')}% (aspect {int((slope.get('aspect_deg') or 0))}°). "
+        f"Key separations (m) include: building {feats.get('d_building_m')}, "
+        f"shed/structure {feats.get('d_outbuilding_m')}, boundary {feats.get('d_boundary_m')}, "
+        f"road {feats.get('d_road_m')}, drain {feats.get('d_drain_m')}, "
+        f"overhead power lines {feats.get('d_overhead_m')}, and rail {feats.get('d_rail_m')}. "
+        f"Wind is {(wind.get('speed_mps') or 0):.1f} m/s from {wind.get('compass') or 'n/a'}. "
+        f"Overall heuristic {risk.get('score','?')}/100 → {risk.get('status','?')}. The score is driven by: "
+        + "; ".join([f"{int(p)} {m}" for p, m in (risk.get('explain') or [])[:4]]) + "."
+    )
+
+    S2 = (
+        f"Flood risk is {flood.get('level','n/a')} ({'; '.join(flood.get('why',[]))}). "
+        f"No mapped watercourse within the search radius if distance is unset. Drains and manholes should be "
+        f"protected during transfers to avoid subsurface gas migration. Land use is {feats.get('land_class','n/a')}."
+    )
+
+    S3 = (
+        f"Approach gradients average/max {appr.get('avg_pct','?')}/{appr.get('max_pct','?')}%. "
+        + (f"Calculated route indirectness is {rr:.2f}× the crow-fly distance. " if rr else "")
+        + "Validate access restrictions and ensure the tanker stand provides sound hardstanding and clear sightlines."
+    )
+
+    S4 = (
+        "Site appears suitable with routine controls." if risk.get('status') == 'PASS'
+        else "Attention required: confirm minimum separations to CoP1, control ignition sources, "
+             "protect drainage, and plan safe approach/egress under adverse conditions."
+    )
+
+    return {
+        "Safety Risk Profile": S1,
+        "Environmental Considerations": S2,
+        "Access & Logistics": S3,
+        "Overall Site Suitability": S4,
+    }
 
     try:
         # Expanded narrative request: 2–4 sentences per section
@@ -971,3 +986,4 @@ if auto and formvals:
 
 else:
     st.info("Enter a what3words address on the left and click **Fetch**. Then review the editable boxes and press **Confirm & Assess**.")
+
