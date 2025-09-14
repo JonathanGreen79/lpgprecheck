@@ -612,7 +612,7 @@ if auto:
                 "Slope (%)": f"{slope_pct:.1f}",
                 "Approach avg/max (%)": f"{approach_avg:.1f} / {approach_max:.1f}",
                 "Flood": "Low — No mapped watercourse nearby" if (water_m is None or water_m >= 150) else "Medium/High",
-            }, expanded=False)
+            }, expanded=True)
 
             st.markdown("#### Separations (~400 m)")
             st.json({
@@ -620,7 +620,7 @@ if auto:
                 "Road/footpath (m)": road_m, "Drain/manhole (m)": drain_m,
                 "Overhead power lines (m)": overhead_m, "Railway (m)": rail_m,
                 "Watercourse (m)": water_m, "Land use": land_use
-            }, expanded=False)
+            }, expanded=True)
 
             st.markdown("#### Vehicle")
             st.json({
@@ -629,7 +629,7 @@ if auto:
                 "Width (m)": veh_width_m,
                 "Height (m)": veh_height_m,
                 "Turning circle (m)": turning_circle_m,
-            }, expanded=False)
+            }, expanded=True)
 
             st.markdown("### Risk result")
             badge = ("✅ PASS" if risk.status=="PASS"
@@ -850,3 +850,4 @@ if auto:
                 )
             else:
                 st.caption("PDF generation unavailable on this host (ReportLab not installed).")
+
