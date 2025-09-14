@@ -183,7 +183,12 @@ def dist_line(lat0, lon0, line):
         cx,cy=ax+t*abx,ay+t*aby
         d=math.hypot(px-cx,py-cy); best=d if best is None else min(best,d)
     return best
-def dist_poly(lat0,lon0,poly): return dist_line(lat0,lon0,poly+poly[:1])
+def dist_poly(lat0, lon0, poly):
+    # Handle None or too-short rings safely
+    if not poly or len(poly) < 2:
+        return None
+    return dist_line(lat0, lon0, poly + poly[:1])
+
 def dist_pts(lat0, lon0, pts):
     if not pts: return None
     mlat,mlon=meters_per_degree(lat0)
@@ -1146,5 +1151,6 @@ if auto and formvals:
 
 else:
     st.info("Enter a what3words address on the left and click **Fetch**. Then review the editable boxes and press **Confirm & Assess**.")
+
 
 
