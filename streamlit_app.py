@@ -27,6 +27,21 @@ MAPBOX_TOKEN   = get_secret("MAPBOX_TOKEN")
 
 UA = {"User-Agent": "LPG-Precheck/1.3"}
 
+# ------------------------- Auth + status helpers -------------------------
+def is_authed() -> bool:
+    pw_expected = get_secret("APP_PASSWORD", "")
+    if not pw_expected:
+        return True  # no password set
+    return bool(st.session_state.get("__auth_ok__", False))
+
+def secrets_status():
+    def tick(flag: bool) -> str:
+        return "✅" if flag else "⚠️"
+    st.markdown("##### Secrets status")
+    st.write(f"{tick(bool(W3W_API_KEY))} what3words API key")
+    st.write(f"{tick(bool(MAPBOX_TOKEN))} Mapbox token")
+    st.write(f"{tick(bool(OPENAI_API_KEY))} OpenAI key (optional)")
+
 # ------------------------- Geom helpers -------------------------
 def meters_per_degree(lat_deg: float) -> Tuple[float, float]:
     lat = math.radians(lat_deg)
@@ -399,12 +414,28 @@ if PAGE_ICON:
 else:
     st.title("LPG Customer Tank — Pre-Check")
 
-st.caption("Enter a what3words location, review/edit auto-filled data, then confirm to assess.")
+# --- Step 1: Access + Secrets status ---
+with st.expander("Step 1 — Access & Keys", expanded=True):
+    secrets_status()
+    pw_expected = get_secret("APP_PASSWORD", "")
+    if pw_expected:
+        pw = st.text_input("Access password", type="password", key="__pw_input__")
+        if st.button("Unlock", key="__unlock_btn__"):
+            st.session_state["__auth_ok__"] = (pw == pw_expected)
+            if not st.session_state["__auth_ok__"]:
+                st.error("Incorrect password")
+    else:
+        st.info("No password set (APP_PASSWORD). Access is open.")
 
+if not is_authed():
+    st.stop()
+
+st.caption("Step 2 — Enter a what3words location, review/edit auto-filled data, then confirm to assess.")
+
+# Step 2 — Location input
 w3w_input = st.text_input("what3words (word.word.word):", value=st.session_state.get("w3w", ""))
 run = st.button("Run Pre-Check", type="primary")
 
-auto: Dict = {}
 if run and w3w_input and w3w_input.count(".") == 2:
     st.session_state["w3w"] = w3w_input.strip()
     with st.status("Fetching site data…", expanded=False):
@@ -418,7 +449,7 @@ if run and w3w_input and w3w_input.count(".") == 2:
         osm  = overpass_near(lat, lon, radius=400)
         feats = parse_osm(lat, lon, osm)
 
-        auto = {
+        st.session_state["auto"] = {
             "lat": lat, "lon": lon,
             "addr": addr,
             "wind_mps": wind.get("speed_mps") or 0.0,
@@ -431,6 +462,8 @@ if run and w3w_input and w3w_input.count(".") == 2:
         }
         st.success("Auto data ready.")
 
+# --- Use persisted auto for the form and results ---
+auto = st.session_state.get("auto", {})
 if auto:
     seed = st.session_state.get("w3w", "")
     submitted = False
@@ -551,7 +584,7 @@ if auto:
 
             if MAPBOX_TOKEN:
                 st.markdown("#### Map")
-                img = fetch_map(auto["lat"], auto["lon"])
+                img = fetch_map(st.session_state["auto"]["lat"], st.session_state["auto"]["lon"])
                 if img:
                     st.image(img, caption="Map (centered on W3W)", use_container_width=True)
 
@@ -591,7 +624,6 @@ if auto:
 
             st.markdown("---")
             st.subheader("Access suitability (vehicle vs restrictions)")
-            # Very lightweight signal based on surface + risk (you can wire back OSM restrictions later)
             if stand_surface in ("asphalt", "concrete", "block paving"):
                 st.success("PASS — no blocking restrictions detected for the selected vehicle.")
             else:
@@ -604,7 +636,7 @@ if auto:
             # Map image persisted if we had one
             map_path = None
             if MAPBOX_TOKEN:
-                img = fetch_map(auto["lat"], auto["lon"])
+                img = fetch_map(st.session_state["auto"]["lat"], st.session_state["auto"]["lon"])
                 if img:
                     map_path = "map_preview.png"
                     try:
@@ -656,14 +688,14 @@ if auto:
                         if line:
                             c.drawString(M, y, line); y -= leading
 
-                # Title line with small icon if present
+                # Title
                 header(f"LPG Pre-Check — ///{st.session_state.get('w3w','')}")
                 addr = ctx["addr"]
                 addr_line = ", ".join([p for p in [addr.get("road"), addr.get("city"), addr.get("postcode")] if p])
                 if addr_line: text_line(addr_line, col=grey)
                 if addr.get("display_name"): text_line(addr["display_name"], col=grey)
 
-                # Map (if any)
+                # Map
                 if map_file and os.path.exists(map_file):
                     try:
                         ir = ImageReader(map_file)
@@ -726,7 +758,7 @@ if auto:
 
             # Build the context to mirror the screen
             ctx_pdf = {
-                "addr": auto.get("addr", {}),
+                "addr": st.session_state["auto"].get("addr", {}),
                 "wind": wind,
                 "slope_pct": slope_pct,
                 "approach_avg": approach_avg,
