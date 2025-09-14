@@ -341,33 +341,103 @@ vehicle = VEHICLES[vehicle_name]
 # ============================== Form widgets ==================================
 
 def nm_distance(label: str, key: str, auto_val: Optional[float], max_val=2000.0) -> Optional[float]:
-    """One-line 'Not mapped' + number input that is always editable.
-    The checkbox only decides whether we return None or the typed value,
-    so it works inside st.form without relying on disabled=..."""
-    # initial state
-    if f"{key}_nm" not in st.session_state:
-        st.session_state[f"{key}_nm"] = (auto_val is None)
-    if f"{key}_val" not in st.session_state:
-        st.session_state[f"{key}_val"] = 0.0 if auto_val is None else float(auto_val)
-
-    c1, c2 = st.columns([0.78, 0.22])  # compact, single row
-    with c1:
-        # always editable; pre-filled with auto value (or 0.0 if unknown)
+    """Compact 'Not mapped' + number input, instantly toggleable."""
+    lcol, rcol = st.columns([0.78, 0.22])
+    with rcol:
+        if f"{key}_unknown" not in st.session_state:
+            st.session_state[f"{key}_unknown"] = (auto_val is None)
+        unknown = st.checkbox("Not mapped", key=f"{key}_unknown")
+    with lcol:
+        if f"{key}_val" not in st.session_state:
+            st.session_state[f"{key}_val"] = 0.0 if auto_val is None else float(auto_val)
+        disabled = st.session_state[f"{key}_unknown"]
         val = st.number_input(
             label,
-            min_value=0.0, max_value=float(max_val), step=0.1,
-            value=float(st.session_state[f"{key}_val"]),
-            key=f"{key}_val_input"
+            min_value=0.0,
+            max_value=float(max_val),
+            step=0.1,
+            value=st.session_state[f"{key}_val"],
+            disabled=disabled,
+            key=f"{key}_val"
         )
-    with c2:
-        nm = st.checkbox("Not mapped", value=st.session_state[f"{key}_nm"], key=f"{key}_nm_chk")
+    return None if st.session_state[f"{key}_unknown"] else float(val)
 
-    # persist the latest state
-    st.session_state[f"{key}_val"] = val
-    st.session_state[f"{key}_nm"] = nm
 
-    # return None when 'Not mapped' is ticked; otherwise the typed float
-    return None if nm else float(val)
+# --- Site form ---
+submitted = False  # make sure the variable always exists
+
+with st.form("inputs"):
+    st.subheader("Environment & approach")
+    e1, e2, e3 = st.columns(3)
+    with e1:
+        wind_mps = st.number_input("Wind (m/s)", 0.0, 60.0, float(auto.get("wind_mps", 0.0)), 0.1)
+    with e2:
+        wind_deg = st.number_input("Wind dir (°)", 0, 359, int(auto.get("wind_deg", 0)), 1)
+    with e3:
+        slope_pct = st.number_input("Slope (%)", 0.0, 100.0, float(auto.get("slope_pct", 0.0)), 0.1)
+
+    a1, a2, a3 = st.columns(3)
+    with a1:
+        approach_avg = st.number_input("Approach avg (%)", 0.0, 100.0, float(auto.get("approach_avg", 0.0)), 0.1)
+    with a2:
+        approach_max = st.number_input("Approach max (%)", 0.0, 100.0, float(auto.get("approach_max", 0.0)), 0.1)
+    with a3:
+        rr_default = "" if auto.get("rr") is None else f"{auto['rr']:.2f}"
+        rr_str = st.text_input("Route indirectness (× crow-fly)", value=rr_default, placeholder="leave blank")
+        try:
+            route_ratio = float(rr_str) if rr_str.strip() else None
+        except:
+            route_ratio = None
+
+    st.markdown("---")
+    st.subheader("Separations (~400 m)")
+    s1, s2 = st.columns(2)
+    with s1:
+        building_m = nm_distance("Building (m)", "d_building_m", auto.get("building_m"))
+        road_m     = nm_distance("Road/footpath (m)", "d_road_m", auto.get("road_m"))
+        overhead_m = nm_distance("Overhead power lines (m)", "d_overhead_m", auto.get("overhead_m"))
+        water_m    = nm_distance("Watercourse (m)", "d_water_m", auto.get("water_m"))
+    with s2:
+        boundary_m = nm_distance("Boundary (m)", "d_boundary_m", auto.get("boundary_m"))
+        drain_m    = nm_distance("Drain/manhole (m)", "d_drain_m", auto.get("drain_m"))
+        rail_m     = nm_distance("Railway (m)", "d_rail_m", auto.get("rail_m"))
+        land_use   = st.selectbox(
+            "Land use",
+            ["Domestic/Urban", "Industrial", "Mixed", "Rural/Agricultural"],
+            index=["Domestic/Urban", "Industrial", "Mixed", "Rural/Agricultural"].index(
+                auto.get("land_class", "Domestic/Urban")
+            )
+        )
+
+    st.markdown("---")
+    st.subheader("Site options")
+    v1, v2 = st.columns([0.5, 0.5])
+    with v1:
+        veg_3m = st.slider("Vegetation within 3 m of tank (0 none → 3 heavy)", 0, 3, 1)
+        enclosure_sides = st.select_slider(
+            "Number of solid sides enclosing tank/stand (fence/walls)",
+            options=[0, 1, 2, 3, 4], value=3
+        )
+        los_issue = st.checkbox("Restricted line-of-sight at stand", value=False)
+    with v2:
+        stand_surface = st.selectbox(
+            "Stand surface",
+            ["asphalt", "concrete", "block paving", "gravel", "grass", "other"],
+            index=0
+        )
+        open_field_m = nm_distance("Distance to open field (m)", "d_open_field_m", None)
+
+    notes_txt = st.text_input("Notes (vegetation / sightlines / special instructions)", value="")
+
+    # ✅ must be inside form
+    submitted = st.form_submit_button("Confirm & assess", type="primary")
+
+
+# outside the form
+if submitted:
+    # run assessment logic
+    st.success("Inputs confirmed, running risk assessment…")
+
 
 
 # =============================== Risk & helpers ===============================
@@ -720,4 +790,5 @@ if submitted:
         pdf_path = build_pdf(st.session_state.get("w3w","site"), addr, lat, lon, values, rs, rs["explain"], controls, ai, pdf_map, site)
         with open(pdf_path, "rb") as f:
             st.download_button("📄 Download PDF report", f, file_name=os.path.basename(pdf_path), type="secondary")
+
 
