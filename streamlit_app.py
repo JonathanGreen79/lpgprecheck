@@ -41,10 +41,10 @@ def sidebar_secrets_status():
     def tick(flag: bool) -> str:
         return "✅" if flag else "⚠️"
     st.sidebar.markdown("#### API and Token Access")
-    st.sidebar.write(f"{tick(bool(W3W_API_KEY))} what3words API key")
-    st.sidebar.write(f"{tick(bool(MAPBOX_TOKEN))} Mapbox token")
-    st.sidebar.write(f"{tick(bool(OPENAI_API_KEY))} OpenAI key (optional)")
-    st.sidebar.write(f"{tick(bool(APP_PASSWORD))} App password")
+    st.sidebar.write(f"{tick(bool(W3W_API_KEY))} What3Words API")
+    st.sidebar.write(f"{tick(bool(MAPBOX_TOKEN))} Mapbox Token")
+    st.sidebar.write(f"{tick(bool(OPENAI_API_KEY))} OpenAI key")
+    st.sidebar.write(f"{tick(bool(APP_PASSWORD))} App Authenticator")
 
 def sidebar_access():
     st.sidebar.markdown("#### Access")
@@ -936,6 +936,7 @@ if auto:
                 )
             else:
                 st.caption("PDF generation unavailable on this host (ReportLab not installed).")
+
 
 
 
