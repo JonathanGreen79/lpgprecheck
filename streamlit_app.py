@@ -731,8 +731,6 @@ if auto:
                 key="los_tgl"
             )
 
-
-            los_issue = (los_slider == "Yes")
         with v2:
             stand_surface = st.selectbox(
                 "Stand surface",
@@ -1038,6 +1036,7 @@ if auto:
                 )
             else:
                 st.caption("PDF generation unavailable on this host (ReportLab not installed).")
+
 
 
 
