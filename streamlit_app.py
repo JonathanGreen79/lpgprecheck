@@ -538,28 +538,12 @@ else:
 
 st.caption("Enter a what3words location, review/edit auto-filled data, then confirm to assess.")
 
-# Location input
-w3w_input = st.text_input(
-    "what3words (word.word.word):",
-    value=st.session_state.get("w3w", "")
-)
-
-# Buttons after input
-c_run, c_reset, _ = st.columns([0.18, 0.14, 0.68])
+# Location input + Run + Reset
+c_run, c_reset, c_spacer = st.columns([0.18, 0.14, 0.68])
 with c_run:
     run = st.button("Run Pre-Check", type="primary", use_container_width=True)
 with c_reset:
     reset = st.button("Reset", type="secondary", use_container_width=True)
-
-
-
-# Buttons after input
-c_run, c_reset, _ = st.columns([0.18, 0.14, 0.68])
-with c_run:
-    run = st.button("Run Pre-Check", type="primary", use_container_width=True)
-with c_reset:
-    reset = st.button("Reset", type="secondary", use_container_width=True)
-
 
 if reset:
     for k in list(st.session_state.keys()):
@@ -1016,5 +1000,3 @@ if auto:
                 )
             else:
                 st.caption("PDF generation unavailable on this host (ReportLab not installed).")
-
-
