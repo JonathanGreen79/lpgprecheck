@@ -62,9 +62,8 @@ def sidebar_access():
         ok = (st.session_state.get("__pw_input__", "") == APP_PASSWORD)
         st.session_state["__auth_ok__"] = ok
         if ok:
-            # clear the typed password and re-run so the input disappears immediately
             st.session_state["__pw_input__"] = ""
-            st.rerun()
+    
 
     st.sidebar.text_input(
         "Password",
@@ -1036,6 +1035,7 @@ if auto:
                 )
             else:
                 st.caption("PDF generation unavailable on this host (ReportLab not installed).")
+
 
 
 
