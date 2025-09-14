@@ -230,7 +230,7 @@ def parse_osm(lat0,lon0,data)->Dict:
     d_over =min([dist_line(lat0,lon0,l) for l in plines]+([dist_pts(lat0,lon0,pnodes)] if pnodes else []) or [None])
     d_rail =min([dist_line(lat0,lon0,l) for l in rails] or [None])
     d_water=min([dist_line(lat0,lon0,l) for l in wlines]+[dist_poly(lat0,lon0,p) for p in wpolys] or [None])
-    land_counts={}; 
+    land_counts={}
     for lp in land_polys: land_counts[lp["tag"]] = land_counts.get(lp["tag"],0)+1
     if land_counts:
         top=max(land_counts,key=lambda k:land_counts[k])
@@ -432,7 +432,6 @@ def risk_score(feats, wind, slope, appr, rr, notes, surf, flood, answers=None, c
     if notes: add(min(12, 4*len(notes)),"Access restrictions: "+", ".join(notes))
     if surf.get("risky_count",0)>0: add(min(10, W.get("surface_flag_per",2)*surf['risky_count']), f"Surface flags={surf['risky_count']}")
     if answers.get("onsite_ignitions") is True: add(W.get("excel_ignitions_3m",6), "On-site ignition within 3 m (user)")
-    # (drain toggle removed; we rely on measured distance)
     stype=(answers.get("surface_type") or "").lower()
     if stype in ("gravel","grass"): add(min(10, W.get("surface_flag_per",2)*2), f"Soft surface: {stype}")
     score=round(min(100.0,max(0.0,score)),1)
@@ -441,48 +440,51 @@ def risk_score(feats, wind, slope, appr, rr, notes, surf, flood, answers=None, c
     return {"score":score,"status":status,"explain":why}
 
 # ─────────────────────────── AI commentary ─────────────────────
-def offline(ctx: Dict) -> Dict[str,str]:
-    feats,wind,slope,appr,rr,flood,risk = (ctx.get(k,{}) for k in
-        ["features","wind","slope","approach","route_ratio","flood","risk"])
+def ai_sections(context: Dict) -> Dict[str,str]:
+    def offline(ctx: Dict) -> Dict[str,str]:
+        feats,wind,slope,appr,rr,flood,risk = (ctx.get(k,{}) for k in
+            ["features","wind","slope","approach","route_ratio","flood","risk"])
 
-    S1 = (
-        f"The local slope is {slope.get('grade_pct','?')}% (aspect {int((slope.get('aspect_deg') or 0))}°). "
-        f"Key separations (m) include: building {feats.get('d_building_m')}, "
-        f"shed/structure {feats.get('d_outbuilding_m')}, boundary {feats.get('d_boundary_m')}, "
-        f"road {feats.get('d_road_m')}, drain {feats.get('d_drain_m')}, "
-        f"overhead power lines {feats.get('d_overhead_m')}, and rail {feats.get('d_rail_m')}. "
-        f"Wind is {(wind.get('speed_mps') or 0):.1f} m/s from {wind.get('compass') or 'n/a'}. "
-        f"Overall heuristic {risk.get('score','?')}/100 → {risk.get('status','?')}. The score is driven by: "
-        + "; ".join([f"{int(p)} {m}" for p, m in (risk.get('explain') or [])[:4]]) + "."
-    )
+        S1 = (
+            f"The local slope is {slope.get('grade_pct','?')}% (aspect {int((slope.get('aspect_deg') or 0))}°). "
+            f"Key separations (m) include: building {feats.get('d_building_m')}, "
+            f"shed/structure {feats.get('d_outbuilding_m')}, boundary {feats.get('d_boundary_m')}, "
+            f"road {feats.get('d_road_m')}, drain {feats.get('d_drain_m')}, "
+            f"overhead power lines {feats.get('d_overhead_m')}, and rail {feats.get('d_rail_m')}. "
+            f"Wind is {(wind.get('speed_mps') or 0):.1f} m/s from {wind.get('compass') or 'n/a'}. "
+            f"Overall heuristic {risk.get('score','?')}/100 → {risk.get('status','?')}. The score is driven by: "
+            + "; ".join([f"{int(p)} {m}" for p, m in (risk.get('explain') or [])[:4]]) + "."
+        )
 
-    S2 = (
-        f"Flood risk is {flood.get('level','n/a')} ({'; '.join(flood.get('why',[]))}). "
-        f"No mapped watercourse within the search radius if distance is unset. Drains and manholes should be "
-        f"protected during transfers to avoid subsurface gas migration. Land use is {feats.get('land_class','n/a')}."
-    )
+        S2 = (
+            f"Flood risk is {flood.get('level','n/a')} ({'; '.join(flood.get('why',[]))}). "
+            f"No mapped watercourse within the search radius if distance is unset. Drains and manholes should be "
+            f"protected during transfers to avoid subsurface gas migration. Land use is {feats.get('land_class','n/a')}."
+        )
 
-    S3 = (
-        f"Approach gradients average/max {appr.get('avg_pct','?')}/{appr.get('max_pct','?')}%. "
-        + (f"Calculated route indirectness is {rr:.2f}× the crow-fly distance. " if rr else "")
-        + "Validate access restrictions and ensure the tanker stand provides sound hardstanding and clear sightlines."
-    )
+        S3 = (
+            f"Approach gradients average/max {appr.get('avg_pct','?')}/{appr.get('max_pct','?')}%. "
+            + (f"Calculated route indirectness is {rr:.2f}× the crow-fly distance. " if rr else "")
+            + "Validate access restrictions and ensure the tanker stand provides sound hardstanding and clear sightlines."
+        )
 
-    S4 = (
-        "Site appears suitable with routine controls." if risk.get('status') == 'PASS'
-        else "Attention required: confirm minimum separations to CoP1, control ignition sources, "
-             "protect drainage, and plan safe approach/egress under adverse conditions."
-    )
+        S4 = (
+            "Site appears suitable with routine controls." if risk.get('status') == 'PASS'
+            else "Attention required: confirm minimum separations to CoP1, control ignition sources, "
+                 "protect drainage, and plan safe approach/egress under adverse conditions."
+        )
 
-    return {
-        "Safety Risk Profile": S1,
-        "Environmental Considerations": S2,
-        "Access & Logistics": S3,
-        "Overall Site Suitability": S4,
-    }
+        return {
+            "Safety Risk Profile": S1,
+            "Environmental Considerations": S2,
+            "Access & Logistics": S3,
+            "Overall Site Suitability": S4,
+        }
+
+    if not OPENAI_API_KEY:
+        return offline(context)
 
     try:
-        # Expanded narrative request: 2–4 sentences per section
         prompt = f"""
 You are an expert LPG site assessor. Using the context JSON, write professional narrative commentary.
 Use four sections exactly:
@@ -496,6 +498,7 @@ practical actions. Avoid repeating the headings inside the paragraphs.
 Context JSON:
 {json.dumps(context, ensure_ascii=False)}
 """.strip()
+
         r = requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type":"application/json"},
@@ -504,7 +507,9 @@ Context JSON:
                               {"role":"user","content":prompt}]},
             timeout=45
         )
-        if r.status_code != 200: return offline(context)
+        if r.status_code != 200:
+            return offline(context)
+
         text = r.json()["choices"][0]["message"]["content"].strip()
         sections = {"Safety Risk Profile":"","Environmental Considerations":"","Access & Logistics":"","Overall Site Suitability":""}
         current=None; mapping={"[1]":"Safety Risk Profile","[2]":"Environmental Considerations","[3]":"Access & Logistics","[4]":"Overall Site Suitability"}
@@ -512,10 +517,12 @@ Context JSON:
             t=line.strip()
             for key,name in mapping.items():
                 if t.startswith(key):
-                    current=name; t=t[len(key):].strip(":- \t"); 
+                    current=name; t=t[len(key):].strip(":- \t")
                     if t: sections[current]+=t+"\n"; break
             else:
                 if current: sections[current]+=t+"\n"
+
+        # tidy + fallback
         clean={}
         for heading, body in sections.items():
             lines=[ln.rstrip() for ln in (body or "").splitlines()]
@@ -525,6 +532,7 @@ Context JSON:
         for k in clean:
             if not clean[k]: clean[k]=fb[k]
         return clean
+
     except Exception:
         return offline(context)
 
@@ -794,7 +802,7 @@ if auto and formvals:
 
         st.markdown("<hr/>", unsafe_allow_html=True)
 
-        # Site answers (no drain toggle; we use measured distance)
+        # Site answers
         st.subheader("Site answers")
         a1, a2 = st.columns([0.55, 0.45])
         with a1:
@@ -986,4 +994,6 @@ if auto and formvals:
 
 else:
     st.info("Enter a what3words address on the left and click **Fetch**. Then review the editable boxes and press **Confirm & Assess**.")
+
+
 
