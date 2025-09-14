@@ -40,7 +40,7 @@ def is_authed() -> bool:
 def sidebar_secrets_status():
     def tick(flag: bool) -> str:
         return "✅" if flag else "⚠️"
-    st.sidebar.markdown("#### Secrets status")
+    st.sidebar.markdown("#### API and Token Access")
     st.sidebar.write(f"{tick(bool(W3W_API_KEY))} what3words API key")
     st.sidebar.write(f"{tick(bool(MAPBOX_TOKEN))} Mapbox token")
     st.sidebar.write(f"{tick(bool(OPENAI_API_KEY))} OpenAI key (optional)")
@@ -52,26 +52,33 @@ def sidebar_access():
         st.sidebar.warning("No APP_PASSWORD set — access is open.")
         return
 
-    # PW input (pressing Enter will also try to unlock)
-    def _try_unlock():
-        st.session_state["__auth_ok__"] = (st.session_state.get("__pw_input__", "") == APP_PASSWORD)
+    # If already authenticated, show message and stop rendering the input
+    if st.session_state.get("__auth_ok__", False):
+        st.sidebar.success("🔓 Access authenticated")
+        return
 
-    pw = st.sidebar.text_input(
+    # Otherwise, show the password input + unlock button
+    def _try_unlock():
+        ok = (st.session_state.get("__pw_input__", "") == APP_PASSWORD)
+        st.session_state["__auth_ok__"] = ok
+        if ok:
+            # clear the typed password and re-run so the input disappears immediately
+            st.session_state["__pw_input__"] = ""
+            st.rerun()
+
+    st.sidebar.text_input(
         "Password",
         type="password",
         key="__pw_input__",
-        on_change=_try_unlock,  # unlock on Enter
+        on_change=_try_unlock,  # pressing Enter unlocks too
     )
-
-    # Button also tries to unlock
     if st.sidebar.button("Unlock", key="__unlock_btn__"):
         _try_unlock()
 
-    # NOW check auth *after* we may have updated it this run
-    if bool(st.session_state.get("__auth_ok__", False)):
-        st.sidebar.success("🔓 Access authenticated")
-    else:
+    # If still not authed after attempts, nudge the user
+    if not st.session_state.get("__auth_ok__", False):
         st.sidebar.info("Enter the password to continue.")
+
 
 
 # ------------------------- Vehicle presets -------------------------
@@ -929,5 +936,6 @@ if auto:
                 )
             else:
                 st.caption("PDF generation unavailable on this host (ReportLab not installed).")
+
 
 
