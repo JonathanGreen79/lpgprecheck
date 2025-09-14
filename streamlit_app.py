@@ -725,11 +725,12 @@ if auto:
                 "Number of solid sides enclosing tank/stand (fence/walls)",
                 options=[0, 1, 2, 3, 4], value=0, key="enclosure_sides_sel"
             )
-            los_issue = st.checkbox(
-            "Restricted line-of-sight at Delivery Point",
-            value=False,
-            key="los_chk"
+            los_issue = st.toggle(
+                "Restricted line-of-sight at Delivery Point",
+                value=False,
+                key="los_tgl"
             )
+
 
             los_issue = (los_slider == "Yes")
         with v2:
@@ -1037,5 +1038,6 @@ if auto:
                 )
             else:
                 st.caption("PDF generation unavailable on this host (ReportLab not installed).")
+
 
 
