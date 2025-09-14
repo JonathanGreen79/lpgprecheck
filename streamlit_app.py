@@ -25,16 +25,16 @@ W3W_API_KEY    = get_secret("W3W_API_KEY")
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")  # not used in this offline build
 MAPBOX_TOKEN   = get_secret("MAPBOX_TOKEN")
 
-UA = {"User-Agent": "LPG-Precheck/1.4"}
+UA = {"User-Agent": "LPG-Precheck/1.5"}
 
 # ------------------------- Auth + status helpers -------------------------
 def effective_password() -> str:
-    # Prefer APP_PASSWORD; otherwise fall back to the original value you used.
+    # Prefer APP_PASSWORD; fallback to your previous value.
     return get_secret("APP_PASSWORD", "Flogas2025")
 
 def is_authed() -> bool:
     pw_expected = effective_password()
-    if not pw_expected:  # empty means open access
+    if not pw_expected:
         return True
     return bool(st.session_state.get("__auth_ok__", False))
 
@@ -45,7 +45,6 @@ def sidebar_secrets_status():
     st.sidebar.write(f"{tick(bool(W3W_API_KEY))} what3words API key")
     st.sidebar.write(f"{tick(bool(MAPBOX_TOKEN))} Mapbox token")
     st.sidebar.write(f"{tick(bool(OPENAI_API_KEY))} OpenAI key (optional)")
-    st.sidebar.caption("Tip: set via `.streamlit/secrets.toml` or environment variables.")
 
 def sidebar_access():
     st.sidebar.markdown("#### Access")
@@ -434,6 +433,34 @@ def nm_distance(
 
     return None if nm else float(val)
 
+# ------------------------- Pretty key/value block -------------------------
+def kv_block(title: str, data: Dict, cols: int = 2, fmt: Dict[str, str] | None = None):
+    """Pretty key/value block."""
+    st.markdown(f"### {title}" if title.lower().startswith("key") else f"#### {title}")
+    keys = list(data.keys())
+    rows = (len(keys) + cols - 1) // cols
+    fmt = fmt or {}
+    # normalize values
+    def show(k, v):
+        if v is None:
+            return "—"
+        if isinstance(v, (int, float)) and k in fmt:
+            try:
+                return format(v, fmt[k])
+            except Exception:
+                return str(v)
+        return str(v)
+    for r in range(rows):
+        cs = st.columns(cols)
+        for c in range(cols):
+            i = r + c*rows
+            if i < len(keys):
+                k = keys[i]
+                v = data[k]
+                with cs[c]:
+                    st.markdown(f"**{k}**")
+                    st.markdown(show(k, v))
+
 # ------------------------- Sidebar (status & access) -------------------------
 sidebar_secrets_status()
 sidebar_access()
@@ -452,11 +479,27 @@ else:
 
 st.caption("Enter a what3words location, review/edit auto-filled data, then confirm to assess.")
 
-# Location input
+# Location input + Run + Reset
+c_run, c_reset, c_spacer = st.columns([0.18, 0.14, 0.68])
+with c_run:
+    run = st.button("Run Pre-Check", type="primary", use_container_width=True)
+with c_reset:
+    reset = st.button("Reset", type="secondary", use_container_width=True)
+
+# Reset: clear data below and W3W, hide edit/results until new W3W entered
+if reset:
+    for k in list(st.session_state.keys()):
+        if k.startswith("d_") or k.endswith("__val") or k.endswith("__nm") or k.endswith("__seed") or k.startswith("veh_"):
+            st.session_state.pop(k, None)
+    st.session_state.pop("auto", None)
+    st.session_state.pop("w3w", None)
+    st.rerun()
+
 w3w_input = st.text_input("what3words (word.word.word):", value=st.session_state.get("w3w", ""))
-run = st.button("Run Pre-Check", type="primary")
 
 if run and w3w_input and w3w_input.count(".") == 2:
+    # Clear previous auto so sections hide while spinner shows
+    st.session_state.pop("auto", None)
     st.session_state["w3w"] = w3w_input.strip()
     with st.status("Fetching site data…", expanded=False):
         lat, lon = w3w_to_latlon(st.session_state["w3w"])
@@ -533,12 +576,14 @@ if auto:
 
         st.markdown("---")
         st.subheader("Vehicle")
-        # Vehicle selector with preset dimensions (editable)
         vcol1, vcol2, vcol3, vcol4 = st.columns(4)
         with vcol1:
-            vehicle_type = st.selectbox("Type", list(VEHICLE_PRESETS.keys()), index=list(VEHICLE_PRESETS.keys()).index("LPG Tanker (Urban)") if "LPG Tanker (Urban)" in VEHICLE_PRESETS else 0)
+            vehicle_type = st.selectbox(
+                "Type",
+                list(VEHICLE_PRESETS.keys()),
+                index=list(VEHICLE_PRESETS.keys()).index("LPG Tanker (Urban)") if "LPG Tanker (Urban)" in VEHICLE_PRESETS else 0
+            )
         preset = VEHICLE_PRESETS[vehicle_type]
-        # seed editable boxes (keep last edits per vehicle)
         basekey = f"veh_{vehicle_type}"
         if f"{basekey}_seeded" not in st.session_state:
             for k, v in preset.items():
@@ -553,8 +598,7 @@ if auto:
         tc_col = st.columns(4)[0]
         with tc_col:
             turning_circle_m = st.number_input("Turning circle (m)", 8.0, 30.0, float(st.session_state.get(f"{basekey}_turning_circle_m", preset["turning_circle_m"])), 0.1)
-
-        # persist edits for this vehicle selection
+        # persist per vehicle
         st.session_state[f"{basekey}_length_m"] = veh_length_m
         st.session_state[f"{basekey}_width_m"] = veh_width_m
         st.session_state[f"{basekey}_height_m"] = veh_height_m
@@ -605,31 +649,47 @@ if auto:
         left, right = st.columns([0.45, 0.55])
 
         with left:
-            st.markdown("### Key metrics")
-            st.json({
-                "Wind (m/s)": f"{wind_mps:.1f}",
-                "Wind dir (°/compass)": f"{wind_deg} / {wind['compass']}",
-                "Slope (%)": f"{slope_pct:.1f}",
-                "Approach avg/max (%)": f"{approach_avg:.1f} / {approach_max:.1f}",
-                "Flood": "Low — No mapped watercourse nearby" if (water_m is None or water_m >= 150) else "Medium/High",
-            }, expanded=True)
+            kv_block(
+                "Key metrics",
+                {
+                    "Wind (m/s)": round(wind_mps, 1),
+                    "Wind dir (°/compass)": f"{wind_deg} / {wind['compass']}",
+                    "Slope (%)": round(slope_pct, 1),
+                    "Approach avg/max (%)": f"{approach_avg:.1f} / {approach_max:.1f}",
+                    "Flood": "Low — No mapped watercourse nearby" if (water_m is None or water_m >= 150) else "Medium/High",
+                },
+                cols=2,
+                fmt={"Wind (m/s)": ".1f", "Slope (%)": ".1f"}
+            )
 
-            st.markdown("#### Separations (~400 m)")
-            st.json({
-                "Building (m)": building_m, "Boundary (m)": boundary_m,
-                "Road/footpath (m)": road_m, "Drain/manhole (m)": drain_m,
-                "Overhead power lines (m)": overhead_m, "Railway (m)": rail_m,
-                "Watercourse (m)": water_m, "Land use": land_use
-            }, expanded=True)
+            kv_block(
+                "Separations (~400 m)",
+                {
+                    "Building (m)": building_m,
+                    "Boundary (m)": boundary_m,
+                    "Road/footpath (m)": road_m,
+                    "Drain/manhole (m)": drain_m,
+                    "Overhead power lines (m)": overhead_m,
+                    "Railway (m)": rail_m,
+                    "Watercourse (m)": water_m,
+                    "Land use": land_use,
+                },
+                cols=2,
+                fmt={"Building (m)": ".1f", "Road/footpath (m)": ".1f", "Railway (m)": ".1f", "Watercourse (m)": ".0f"}
+            )
 
-            st.markdown("#### Vehicle")
-            st.json({
-                "Type": vehicle_type,
-                "Length (m)": veh_length_m,
-                "Width (m)": veh_width_m,
-                "Height (m)": veh_height_m,
-                "Turning circle (m)": turning_circle_m,
-            }, expanded=True)
+            kv_block(
+                "Vehicle",
+                {
+                    "Type": vehicle_type,
+                    "Length (m)": veh_length_m,
+                    "Width (m)": veh_width_m,
+                    "Height (m)": veh_height_m,
+                    "Turning circle (m)": turning_circle_m,
+                },
+                cols=2,
+                fmt={"Length (m)": ".1f", "Width (m)": ".2f", "Height (m)": ".2f", "Turning circle (m)": ".1f"}
+            )
 
             st.markdown("### Risk result")
             badge = ("✅ PASS" if risk.status=="PASS"
@@ -670,7 +730,6 @@ if auto:
                 "Add temporary cones/signage; consider a convex mirror or visibility aids.",
                 "Plan approach/egress to avoid reversing where practicable.",
             ]
-            # Context-aware nudges
             if stand_surface in ("gravel", "grass"):
                 controls_list.append("Ensure firm, level stand surface (temporary mats if required).")
             if overhead_m is not None and overhead_m < CoP["overhead_info_m"]:
@@ -680,7 +739,6 @@ if auto:
 
             st.markdown("---")
             st.subheader("Access suitability (vehicle vs restrictions)")
-            # Very simple heuristic using surface + turning circle
             if stand_surface in ("asphalt", "concrete", "block paving") and turning_circle_m <= 22.0:
                 st.success("PASS — no blocking restrictions detected for the selected vehicle.")
             else:
@@ -690,7 +748,6 @@ if auto:
             st.markdown("### Export")
             st.caption("Generate a one-page PDF summary (includes key metrics, separations, vehicle, AI commentary, controls, and map if available).")
 
-            # Map image persisted if we had one
             map_path = None
             if MAPBOX_TOKEN:
                 img = fetch_map(st.session_state["auto"]["lat"], st.session_state["auto"]["lon"])
@@ -796,7 +853,7 @@ if auto:
                 # Risk
                 header("Risk score", size=13)
                 text_line(f"Total: {ctx['risk'].score:.1f}/100 → {ctx['risk'].status}", bold=True)
-                for p, m in ctx["risk"].explain[:7]:
+                for p, m in ctx['risk'].explain[:7]:
                     text_line(f"+{p} {m}")
 
                 # Controls
@@ -819,7 +876,6 @@ if auto:
                 c.save()
                 return buf.getvalue()
 
-            # Build the context to mirror the screen
             ctx_pdf = {
                 "addr": st.session_state["auto"].get("addr", {}),
                 "wind": wind,
@@ -850,4 +906,3 @@ if auto:
                 )
             else:
                 st.caption("PDF generation unavailable on this host (ReportLab not installed).")
-
