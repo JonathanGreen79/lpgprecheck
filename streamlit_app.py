@@ -479,9 +479,10 @@ def kv_block(title: str, data: Dict, cols: int = 2, fmt: Dict[str, str] | None =
                 k = keys[i]
                 v = data[k]
                 with cs[c]:
-                    st.markdown(f"**{k}**")
-                    st.markdown(show(k, v))
-
+                    st.markdown(
+                        f"<div style='line-height:1.4'><b>{k}:</b> {show(k,v)}</div>",
+                        unsafe_allow_html=True,
+                    )
 # ------------------------- Sidebar (status & access) -------------------------
 sidebar_secrets_status()
 sidebar_access()
@@ -936,6 +937,7 @@ if auto:
                 )
             else:
                 st.caption("PDF generation unavailable on this host (ReportLab not installed).")
+
 
 
 
