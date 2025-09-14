@@ -1,605 +1,561 @@
-import io, json, math, re, requests
-from typing import Dict, List, Tuple, Optional, Any
-from types import SimpleNamespace
+# streamlit_app.py
+from __future__ import annotations
+import os, io, math, json, textwrap, shutil
+from typing import Dict, List, Tuple, Optional
+
+import requests
 import streamlit as st
+from PIL import Image, ImageDraw
+# PDF
+from reportlab.pdfgen import canvas as rl_canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.utils import ImageReader
+from reportlab.lib import colors
+from reportlab.pdfbase import pdfmetrics
 
-# ──────────────────────────────────────────────────────────────
-# Step 1 — Hard-coded password gate
-# ──────────────────────────────────────────────────────────────
-APP_PASSWORD = "Flogas2025"  # <-- as requested
+# -------------------------
+# App config
+# -------------------------
+APP_PASSWORD = "Flogas2025"
+APP_TITLE = "LPG Customer Tank — Pre-Check"
 
-def auth_gate():
-    st.title("🔒 LPG Pre-Check — Access")
-    st.caption("Step 1: Enter the access password to continue.")
-    pwd = st.text_input("Password", type="password", placeholder="Enter password…")
-    col1, col2 = st.columns([0.25, 0.75])
-    go = col1.button("Unlock", type="primary", use_container_width=True)
-    if go:
-        if pwd == APP_PASSWORD:
-            st.session_state.auth_ok = True
-            st.rerun()              # <- replace experimental_rerun() with rerun()
-        else:
-            st.error("Incorrect password.")
-    st.stop()
-
-
-# ──────────────────────────────────────────────────────────────
-# Page config & styles
-# ──────────────────────────────────────────────────────────────
-st.set_page_config(page_title="LPG Customer Tank — Pre-Check", page_icon="icon.png", layout="wide")
-
-st.markdown("""
-<style>
-.smallcaps{font-variant:all-small-caps;letter-spacing:.04em;color:#6b7280}
-.kv{display:flex;justify-content:space-between;gap:.75rem;padding:.5rem .75rem;border:1px solid #eee;border-radius:.5rem;margin:.25rem 0;background:#fafafa}
-.kv-k{color:#6b7280;font-weight:600}
-.kv-v{font-variant-numeric: tabular-nums}
-.pill{display:inline-block;padding:.15rem .5rem;border-radius:999px;background:#eef2ff;border:1px solid #c7d2fe;color:#3730a3;font-size:.85rem;margin:.15rem .25rem 0 0}
-.muted{color:#9ca3af}
-.riskbar{height:10px;border-radius:8px;background:#eee;overflow:hidden;margin:.25rem 0 1rem}
-.riskbar>div{height:100%}
-hr{margin:1rem 0;border:none;border-top:1px solid #eee}
-</style>
-""", unsafe_allow_html=True)
-
-# Require password before anything else
-if not st.session_state.get("auth_ok", False):
-    auth_gate()
-
-# ──────────────────────────────────────────────────────────────
-# Secrets (external APIs)
-# ──────────────────────────────────────────────────────────────
-W3W_API_KEY    = st.secrets.get("W3W_API_KEY", "")
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
-MAPBOX_TOKEN   = st.secrets.get("MAPBOX_TOKEN", "")
-
-# ──────────────────────────────────────────────────────────────
-# Config (risk weights etc.)
-# ──────────────────────────────────────────────────────────────
-CFG = {
-    "cop": {
-        "to_building_m": 3.0, "to_boundary_m": 3.0, "to_ignition_m": 3.0, "to_drain_m": 3.0,
-        "overhead_info_m": 10.0, "overhead_block_m": 5.0, "rail_attention_m": 30.0,
-        "poi_radius_m": 400.0, "wind_stagnant_mps": 1.0, "slope_attention_pct": 3.0,
-        "approach_grade_warn_pct": 18.0, "route_vs_crowfly_ratio_warn": 1.7,
-    },
-    "bands": {"pass_lt": 20, "attention_lt": 50},
-    "weights": {
-        "building":   {"base":18,"per_m":6,"cap":40},
-        "boundary":   {"base":14,"per_m":5,"cap":32},
-        "ignition":   {"base":18,"per_m":6,"cap":40},
-        "drain":      {"base":18,"per_m":6,"cap":40},
-        "overhead_info": 10,
-        "overhead_block": 28,
-        "rail_near": 10,
-        "water_near": 8,
-        "low_wind": 6,
-        "slope_ge6": 12,
-        "slope_ge3": 8,
-        "approach_steep": 12,
-        "route_detour": 10,
-        "surface_flag_per": 2,
-        "excel_ignitions_3m": 6,
-        "fence_side": 4,
-        "los_restricted": 8,
-        "vegetation": 6,                # notes-based nudge
-        "veg_ring_linear_cap": 8,       # slider-based (0–8)
-        "open_field_lt10": 6,
-        "open_field_lt30": 3,
-    },
-    "controls": {
-        "drain_within_3m": {
-            "when": "features.d_drain_m is not None and features.d_drain_m < cop.to_drain_m",
-            "actions": [
-                "Fit drain cover/insert or isolate drain during transfers.",
-                "Install spill containment to prevent entry to drainage."
-            ]
-        },
-        "onsite_ignitions": {
-            "when": "answers.onsite_ignitions is True",
-            "actions": [
-                "Relocate ignition source or maintain ≥3 m separation.",
-                "Mark ATEX zone and enforce no-smoking/no-ignition controls."
-            ]
-        },
-        "vegetation_clearance": {
-            "when": "(answers.veg_within3m_pct or 0) > 0 or bool(answers.vegetation_notes)",
-            "actions": [
-                "Maintain ≥3 m vegetation clearance around the vessel; remove leaf/brush build-up.",
-                "Keep hardstanding clear for footing and spill control."
-            ]
-        },
-        "surface_soft": {
-            "when": "answers.surface_type in ['gravel','grass']",
-            "actions": [
-                "Upgrade stand area to hardstanding (concrete/asphalt) for stability and spill control."
-            ]
-        },
-        "fence_enclosure_controls": {
-            "when": "int(answers.fence_sides) >= 2",
-            "actions": [
-                "Avoid enclosed pockets around the tank: keep ventilation gaps or louvred panels.",
-                "Ensure at least one low-level vented side to disperse heavier-than-air gas."
-            ]
-        },
-        "los_restricted_controls": {
-            "when": "answers.los_restricted is True",
-            "actions": [
-                "Use a trained banksman during manoeuvres and reversing.",
-                "Add temporary cones/signage; consider a convex mirror or visibility aids.",
-                "Plan approach/egress to avoid reversing where practicable."
-            ]
-        }
-    },
-    "vehicle_defaults": {"height_m":3.6, "width_m":2.55, "gross_weight_t":18.0, "length_m":10.0},
+# -------------------------
+# CoP thresholds & vehicle
+# -------------------------
+CoP = {
+    "to_building_m": 3.0, "to_boundary_m": 3.0, "to_ignition_m": 3.0, "to_drain_m": 3.0,
+    "overhead_info_m": 10.0, "overhead_block_m": 5.0, "rail_attention_m": 30.0,
+    "poi_radius_m": 400.0, "wind_stagnant_mps": 1.0, "slope_attention_pct": 3.0,
+    "approach_grade_warn_pct": 18.0, "route_vs_crowfly_ratio_warn": 1.7,
 }
 
-# ──────────────────────────────────────────────────────────────
-# Little UI helpers
-# ──────────────────────────────────────────────────────────────
-def _fmt(v, unit=""):
-    if v is None: return "—"
-    if isinstance(v,(int,float)): return f"{v:.1f}{unit}"
-    return str(v)
+VEHICLES = {
+    "Mini-bulker (default)": {"max_height_m": 3.6, "max_width_m": 2.55, "gross_weight_t": 18.0},
+    "Rigid HGV (medium)":    {"max_height_m": 4.0, "max_width_m": 2.55, "gross_weight_t": 26.0},
+}
+DEFAULT_VEHICLE = "Mini-bulker (default)"
 
-def pills(items: List[str]):
-    if not items:
-        st.markdown("<span class='muted'>None</span>", unsafe_allow_html=True); return
-    html = " ".join(f"<span class='pill'>{str(x)}</span>" for x in items)
-    st.markdown(html, unsafe_allow_html=True)
+# -------------------------
+# Secrets
+# -------------------------
+W3W_API_KEY    = st.secrets.get("W3W_API_KEY", "")
+MAPBOX_TOKEN   = st.secrets.get("MAPBOX_TOKEN", "")
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")  # optional
 
-def keyval(label, value):
-    st.markdown(f"""
-    <div class="kv">
-      <div class="kv-k">{label}</div>
-      <div class="kv-v">{value}</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-# Header with icon
-hdr_l, hdr_r = st.columns([0.07, 0.93])
-with hdr_l:
-    st.image("icon.png", width=40)
-with hdr_r:
-    st.markdown("<h1 style='margin:0 0 .25rem 0'>LPG Customer Tank — Pre-Check</h1>", unsafe_allow_html=True)
-    st.caption("Step 2: Location → Edit → Assess")
-
-# ──────────────────────────────────────────────────────────────
-# Geo helpers & API clients
-# ──────────────────────────────────────────────────────────────
-def meters_per_degree(lat_deg: float) -> Tuple[float,float]:
+# -------------------------
+# Utility functions
+# -------------------------
+def meters_per_degree(lat_deg: float) -> Tuple[float, float]:
     lat = math.radians(lat_deg)
-    return (111132.92 - 559.82*math.cos(2*lat) + 1.175*math.cos(4*lat),
-            111412.84*math.cos(lat) - 93.5*math.cos(3*lat))
-def ll_to_xy(lat0, lon0, lat, lon): mlat,mlon=meters_per_degree(lat0); return (lon-lon0)*mlon,(lat-lat0)*mlat
-def dist_line(lat0, lon0, line):
-    if not line or len(line)<2: return None
-    px,py=0.0,0.0
-    verts=[ll_to_xy(lat0,lon0,la,lo) for la,lo in line]
-    best=None
-    for (ax,ay),(bx,by) in zip(verts,verts[1:]):
-        apx,apy=px-ax,py-ay; abx,aby=bx-ax,by-ay; ab2=abx*abx+aby*aby
-        t=0.0 if ab2==0 else max(0.0,min(1.0),(apx*abx+apy*aby)/ab2)
-        cx,cy=ax+t*abx,ay+t*aby
-        d=math.hypot(px-cx,py-cy); best=d if best is None else min(best,d)
+    return (
+        111132.92 - 559.82 * math.cos(2 * lat) + 1.175 * math.cos(4 * lat),
+        111412.84 * math.cos(lat) - 93.5 * math.cos(3 * lat),
+    )
+
+def ll_to_xy(lat0, lon0, lat, lon):
+    mlat, mlon = meters_per_degree(lat0)
+    return (lon - lon0) * mlon, (lat - lat0) * mlat
+
+def dist_line(lat0, lon0, line: List[Tuple[float,float]]) -> Optional[float]:
+    if not line or len(line) < 2:
+        return None
+    px, py = 0.0, 0.0
+    verts = [ll_to_xy(lat0, lon0, la, lo) for la, lo in line]
+    best = None
+    for (ax, ay), (bx, by) in zip(verts, verts[1:]):
+        apx, apy = px - ax, py - ay
+        abx, aby = bx - ax, by - ay
+        ab2 = abx * abx + aby * aby
+        t = 0.0 if ab2 == 0 else max(0.0, min(1.0, (apx * abx + apy * aby) / ab2))
+        cx, cy = ax + t * abx, ay + t * aby
+        d = math.hypot(px - cx, py - cy)
+        best = d if best is None else min(best, d)
     return best
-def dist_poly(lat0, lon0, poly):
-    # Handle None or too-short rings safely
+
+def dist_poly(lat0, lon0, poly: List[Tuple[float,float]]) -> Optional[float]:
     if not poly or len(poly) < 2:
         return None
     return dist_line(lat0, lon0, poly + poly[:1])
 
-def dist_pts(lat0, lon0, pts):
-    if not pts: return None
-    mlat,mlon=meters_per_degree(lat0)
-    return min(math.hypot((lo-lon0)*mlon,(la-lat0)*mlat) for la,lo in pts)
 def _dist_m(lat0, lon0, lat1, lon1):
-    mlat,mlon=meters_per_degree(lat0)
-    return math.hypot((lon1-lon0)*mlon,(lat1-lat0)*mlat)
+    mlat, mlon = meters_per_degree(lat0)
+    return math.hypot((lon1 - lon0) * mlon, (lat1 - lat0) * mlat)
 
-def w3w_to_latlon(words:str)->Tuple[Optional[float],Optional[float]]:
-    if not W3W_API_KEY: return None,None
+# -------------------------
+# External APIs
+# -------------------------
+def w3w_to_latlon(words: str) -> Tuple[Optional[float], Optional[float]]:
     try:
-        r=requests.get("https://api.what3words.com/v3/convert-to-coordinates",
-                       params={"words":words,"key":W3W_API_KEY},timeout=15)
-        if r.status_code==200:
-            c=r.json().get("coordinates",{})
+        r = requests.get(
+            "https://api.what3words.com/v3/convert-to-coordinates",
+            params={"words": words, "key": W3W_API_KEY}, timeout=15
+        )
+        if r.status_code == 200:
+            c = r.json().get("coordinates", {})
             return c.get("lat"), c.get("lng")
-    except: pass
-    return None,None
+    except Exception:
+        pass
+    return None, None
 
-def reverse_geocode(lat,lon)->Dict:
+def reverse_geocode(lat, lon) -> Dict:
     try:
-        r=requests.get("https://nominatim.openstreetmap.org/reverse",
-                       params={"lat":lat,"lon":lon,"format":"jsonv2"},
-                       headers={"User-Agent":"LPG-Precheck"},timeout=15)
-        if r.status_code==200:
-            j=r.json(); a=j.get("address") or {}
-            return {"display_name":j.get("display_name"),
-                    "road":a.get("road"),"postcode":a.get("postcode"),
-                    "city":a.get("town") or a.get("city") or a.get("village"),
-                    "county":a.get("county"),"state_district":a.get("state_district"),
-                    "local_authority": a.get("municipality") or a.get("county") or a.get("state_district")}
-    except: pass
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/reverse",
+            params={"lat": lat, "lon": lon, "format": "jsonv2"},
+            headers={"User-Agent": "LPG-Precheck"}, timeout=15
+        )
+        if r.status_code == 200:
+            j = r.json(); a = j.get("address") or {}
+            return {
+                "display_name": j.get("display_name"),
+                "road": a.get("road"),
+                "postcode": a.get("postcode"),
+                "city": a.get("town") or a.get("city") or a.get("village"),
+                "county": a.get("county"),
+                "state_district": a.get("state_district"),
+                "local_authority": a.get("municipality") or a.get("county") or a.get("state_district"),
+            }
+    except Exception:
+        pass
     return {}
 
-OVERPASS="https://overpass-api.de/api/interpreter"; UA={"User-Agent":"LPG-Precheck-Streamlit/secure"}
-def overpass(lat,lon,r)->Dict:
-    q=f"""
-    [out:json][timeout:60];
-    (
-      way(around:{r},{lat},{lon})["building"];
-      relation(around:{r},{lat},{lon})["building"];
-      way(around:{r},{lat},{lon})["highway"];
-      node(around:{r},{lat},{lon})["man_made"="manhole"];
-      node(around:{r},{lat},{lon})["manhole"];
-      way(around:{r},{lat},{lon})["waterway"="drain"];
-      way(around:{r},{lat},{lon})["tunnel"="culvert"];
-      way(around:{r},{lat},{lon})["power"="line"];
-      node(around:{r},{lat},{lon})["power"~"tower|pole"];
-      way(around:{r},{lat},{lon})["railway"]["railway"!="abandoned"]["railway"!="disused"];
-      way(around:{r},{lat},{lon})["waterway"~"river|stream|ditch"];
-      way(around:{r},{lat},{lon})["natural"="water"];
-      way(around:{r},{lat},{lon})["landuse"];
-      way(around:{r},{lat},{lon})["maxheight"];
-      way(around:{r},{lat},{lon})["maxwidth"];
-      way(around:{r},{lat},{lon})["maxweight"];
-      way(around:{r},{lat},{lon})["hgv"];
-      way(around:{r},{lat},{lon})["access"];
-      way(around:{r},{lat},{lon})["oneway"];
-      way(around:{r},{lat},{lon})["surface"];
-      way(around:{r},{lat},{lon})["smoothness"];
-    );
-    out tags geom;
-    """
+OVERPASS = "https://overpass-api.de/api/interpreter"
+UA = {"User-Agent": "LPG-Precheck-Pro/2.0"}
+
+def overpass(lat, lon, r) -> Dict:
+    q = f"""
+[out:json][timeout:60];
+(
+  way(around:{r},{lat},{lon})["building"];
+  relation(around:{r},{lat},{lon})["building"];
+
+  way(around:{r},{lat},{lon})["highway"];
+  node(around:{r},{lat},{lon})["man_made"="manhole"];
+  node(around:{r},{lat},{lon})["manhole"];
+  way(around:{r},{lat},{lon})["waterway"="drain"];
+  way(around:{r},{lat},{lon})["tunnel"="culvert"];
+
+  way(around:{r},{lat},{lon})["power"="line"];
+  node(around:{r},{lat},{lon})["power"~"tower|pole"];
+
+  way(around:{r},{lat},{lon})["railway"]["railway"!="abandoned"]["railway"!="disused"];
+  way(around:{r},{lat},{lon})["waterway"~"river|stream|ditch"];
+  way(around:{r},{lat},{lon})["natural"="water"];
+
+  way(around:{r},{lat},{lon})["landuse"];
+
+  /* Road restrictions we care about for access */
+  way(around:{r},{lat},{lon})["maxheight"];
+  way(around:{r},{lat},{lon})["maxwidth"];
+  way(around:{r},{lat},{lon})["maxweight"];
+  way(around:{r},{lat},{lon})["hgv"];
+  way(around:{r},{lat},{lon})["access"];
+  way(around:{r},{lat},{lon})["oneway"];
+  way(around:{r},{lat},{lon})["surface"];
+  way(around:{r},{lat},{lon})["smoothness"];
+);
+out tags geom;
+"""
     try:
-        r=requests.post(OVERPASS,data={"data":q},headers=UA,timeout=90)
-        r.raise_for_status(); return r.json()
-    except: return {"elements":[]}
+        r = requests.post(OVERPASS, data={"data": q}, headers=UA, timeout=90)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        st.info(f"Overpass note: {e}")
+        return {"elements": []}
 
-def parse_osm(lat0,lon0,data)->Dict:
-    bpolys, roads, drains, manholes, plines, pnodes, rails, wlines, wpolys, land_polys = [],[],[],[],[],[],[],[],[],[]
-    rest_ways, surf_ways = [],[]
-    for el in data.get("elements",[]):
-        t=el.get("type"); tags=el.get("tags",{}) or {}; geom=el.get("geometry")
-        coords=[(g["lat"],g["lon"]) for g in (geom or [])]
-        if tags.get("building") and t in ("way","relation"): bpolys.append(coords)
-        elif tags.get("highway") and t=="way":
-            roads.append(coords)
-            if any(k in tags for k in ("maxheight","maxwidth","maxweight","hgv","access","oneway")):
-                rest_ways.append({"tags":tags,"coords":coords})
-            if "surface" in tags or "smoothness" in tags:
-                surf_ways.append({"tags":tags,"coords":coords})
-        elif t=="way" and (tags.get("waterway")=="drain" or tags.get("tunnel")=="culvert"): drains.append(coords)
-        elif t=="node" and (tags.get("man_made")=="manhole" or "manhole" in tags): manholes.append((el.get("lat"),el.get("lon")))
-        elif t=="way" and tags.get("power")=="line": plines.append(coords)
-        elif t=="node" and tags.get("power") in ("tower","pole"): pnodes.append((el.get("lat"),el.get("lon")))
-        elif t=="way" and tags.get("railway") and tags.get("railway") not in ("abandoned","disused"): rails.append(coords)
-        elif t=="way" and tags.get("waterway") in ("river","stream","ditch"): wlines.append(coords)
-        elif t=="way" and tags.get("natural")=="water": wpolys.append(coords)
-        elif t in ("way","relation") and tags.get("landuse"): land_polys.append({"tag":tags.get("landuse"),"coords":coords})
-
-    # Distances
-    d_build=min([dist_poly(lat0,lon0,p) for p in bpolys] or [None])
-    d_road =min([dist_line(lat0,lon0,l) for l in roads] or [None])
-    d_drain=min([dist_line(lat0,lon0,l) for l in drains]+([dist_pts(lat0,lon0,manholes)] if manholes else []) or [None])
-    d_over =min([dist_line(lat0,lon0,l) for l in plines]+([dist_pts(lat0,lon0,pnodes)] if pnodes else []) or [None])
-    d_rail =min([dist_line(lat0,lon0,l) for l in rails] or [None])
-    d_water=min([dist_line(lat0,lon0,l) for l in wlines]+[dist_poly(lat0,lon0,p) for p in wpolys] or [None])
-
-    # NEW: nearest open field / farmland
-    open_tags = {"meadow","grass","farmland","agriculture","pasture","greenfield","orchard","vineyard"}
-    open_polys = [lp["coords"] for lp in land_polys if lp["tag"] in open_tags]
-    d_open = min([dist_poly(lat0,lon0,p) for p in open_polys] or [None])
-
-    # Land class heuristic
-    land_counts={}
-    for lp in land_polys: land_counts[lp["tag"]] = land_counts.get(lp["tag"],0)+1
-    if land_counts:
-        top=max(land_counts,key=lambda k:land_counts[k])
-        land_class = "Domestic/Urban" if top in ("residential","commercial","retail") else ("Industrial" if top in ("industrial","industrial;retail") else "Rural/Agricultural")
-    else:
-        land_class = "Domestic/Urban" if len(bpolys)>80 else ("Rural/Agricultural" if len(bpolys)<20 else "Mixed")
-
-    return {
-        "d_building_m": round(d_build,1) if d_build is not None else None,
-        "d_boundary_m": None,
-        "d_road_m":     round(d_road,1)  if d_road  is not None else None,
-        "d_drain_m":    round(d_drain,1) if d_drain is not None else None,
-        "d_overhead_m": round(d_over,1)  if d_over  is not None else None,
-        "d_rail_m":     round(d_rail,1)  if d_rail  is not None else None,
-        "d_water_m":    round(d_water,1) if d_water is not None else None,
-        "d_open_field_m": round(d_open,1) if d_open is not None else None,  # NEW
-        "land_class": land_class,
-        "counts": {"buildings":len(bpolys),"roads":len(roads),"drains":len(drains),"manholes":len(manholes),
-                   "power_lines":len(plines),"power_structs":len(pnodes),"rail_lines":len(rails),
-                   "water_lines":len(wlines),"water_polys":len(wpolys)},
-        "restrictions": rest_ways, "surfaces": surf_ways, "nearest_road_line": roads[0] if roads else None
-    }
-
-def open_meteo(lat,lon)->Dict:
-    try:
-        r=requests.get("https://api.open-meteo.com/v1/forecast",
-                       params={"latitude":lat,"longitude":lon,"current":"windspeed_10m,winddirection_10m"},timeout=12)
-        cur=r.json().get("current",{}) if r.status_code==200 else {}
-        spd,deg=cur.get("windspeed_10m"),cur.get("winddirection_10m")
-        comp=["N","NE","E","SE","S","SW","W","NW"][round((deg or 0)%360/45)%8] if deg is not None else None
-        return {"speed_mps":spd,"deg":deg,"compass":comp}
-    except: return {"speed_mps":None,"deg":None,"compass":None}
-
-def open_elevations(points):
-    try:
-        locs="|".join(f"{la},{lo}" for la,lo in points)
-        r=requests.get("https://api.open-elevation.com/api/v1/lookup", params={"locations":locs},timeout=15)
-        if r.status_code==200:
-            return [it.get("elevation") for it in r.json().get("results",[])]
-    except: pass
-    return [None]*len(points)
-
-def slope_calc(lat,lon,dx=20.0)->Dict:
-    z=open_elevations([(lat,lon),
-        (lat+dx/meters_per_degree(lat)[0],lon),
-        (lat,lon+dx/meters_per_degree(lat)[1]),
-        (lat-dx/meters_per_degree(lat)[0],lon),
-        (lat,lon-dx/meters_per_degree(lat)[1])])
-    if any(v is None for v in z): return {"elev_m":z[0] if z else None,"grade_pct":None,"aspect_deg":None}
-    zc,zn,ze,zs,zw=z; dz_dy=(zn-zs)/(2*dx); dz_dx=(ze-zw)/(2*dx)
-    grade=math.hypot(dz_dx,dz_dy)*100.0; aspect=(math.degrees(math.atan2(dz_dx,dz_dy))+360)%360
-    return {"elev_m":zc,"grade_pct":round(grade,1),"aspect_deg":round(aspect,0)}
-
-def approach_grade(lat,lon,road_line,N=6)->Dict:
-    if not road_line: return {"avg_pct":None,"max_pct":None}
-    mlat,mlon=meters_per_degree(lat); best,pt=None,None
-    for la,lo in road_line:
-        d=math.hypot((lo-lon)*mlon,(la-lat)*mlat)
-        if best is None or d<best: best,pt=d,(la,lo)
-    if pt is None: return {"avg_pct":None,"max_pct":None}
-    pts=[(lat+(pt[0]-lat)*i/N, lon+(pt[1]-lon)*i/N) for i in range(N+1)]
-    z=open_elevations(pts)
-    if any(v is None for v in z): return {"avg_pct":None,"max_pct":None}
-    grades=[]
-    for i in range(N):
-        run=math.hypot((pts[i+1][1]-pts[i][1])*mlon,(pts[i+1][0]-pts[i][0])*mlat)
-        rise=z[i+1]-z[i]; grades.append(abs(rise/max(run,1e-3))*100.0)
-    return {"avg_pct":round(sum(grades)/len(grades),1), "max_pct":round(max(grades),1)}
-
-def osrm_ratio(lat,lon)->Optional[float]:
-    try:
-        r1=requests.get(f"https://router.project-osrm.org/nearest/v1/driving/{lon},{lat}",timeout=12)
-        if r1.status_code!=200: return None
-        snap_lon,snap_lat = r1.json()["waypoints"][0]["location"]
-        r2=requests.get(f"https://router.project-osrm.org/route/v1/driving/{snap_lon},{snap_lat};{lon},{lat}",
-                        params={"overview":"false"},timeout=15)
-        if r2.status_code!=200: return None
-        dist=float(r2.json()["routes"][0]["distance"])
-        crow=math.hypot(lat-snap_lat,lon-snap_lon)*111000.0
-        if crow<50 or dist<10: return None
-        return dist/crow
-    except: return None
-
-def get_nearest_hospital_osm(lat: float, lon: float) -> dict:
-    base = "https://overpass-api.de/api/interpreter"; headers = {"User-Agent": "LPG-Precheck-Streamlit/Hospital"}
-    def query(r, filt):
-        q=f"""[out:json][timeout:60];({filt});out tags center;"""
-        try:
-            resp=requests.post(base,data={"data":q.format(r=r,lat=lat,lon=lon)},headers=headers,timeout=60)
-            resp.raise_for_status(); return resp.json().get("elements",[])
-        except Exception: return []
-    radii=[2000,5000,10000,20000,50000]
-    best=None
-    for r in radii:
-        filt=f'node(around:{r},{lat},{lon})["amenity"="hospital"]["emergency"~"yes|designated|24_7|24/7"];way(around:{r},{lat},{lon})["amenity"="hospital"]["emergency"~"yes|designated|24_7|24/7"];relation(around:{r},{lat},{lon})["amenity"="hospital"]["emergency"~"yes|designated|24_7|24/7"]'
-        for el in query(r,filt):
-            tags=el.get("tags",{}) or {}
-            la,lo=(el.get("lat"),el.get("lon")) if el.get("type")=="node" else ((el.get("center") or {}).get("lat"), (el.get("center") or {}).get("lon"))
-            if la is None or lo is None: continue
-            d=_dist_m(lat,lon,la,lo)
-            cand={"name":tags.get("name") or "Unnamed hospital","distance_m":d,"lat":la,"lon":lo,"phone":tags.get("phone") or tags.get("contact:phone")}
-            if (best is None) or (d<best["distance_m"]): best=cand
-        if best: return best
-    return {}
-
-# ──────────────────────────────────────────────────────────────
-# Access restrictions & surfaces
-# ──────────────────────────────────────────────────────────────
 def parse_num(s):
-    if not s: return None
-    s=str(s).lower().strip()
-    for u in ("m","meter","metre","meters","metres","t","ton","tonne","tonnes"):
-        if s.endswith(u): s=s[:-len(u)].strip()
-    try: return float(s.replace(",", "."))
-    except: return None
+    if s is None: return None
+    s = str(s).strip().lower()
+    for u in ("m","meter","metre","meters","metres","t","ton","tons","tonne","tonnes"):
+        if s.endswith(u):
+            s = s[:-len(u)].strip()
+            break
+    s = s.replace(",", ".")
+    try:
+        return float(s)
+    except:
+        return None
 
-def humanize_restriction(s: str) -> str:
-    if not s: return s
-    t = s.strip().lower()
-    m = re.search(r"maxheight\s*([\d.,]+)", t)
-    if m: return f"Max height {m.group(1).replace(',', '.')} m"
-    m = re.search(r"maxwidth\s*([\d.,]+)", t)
-    if m: return f"Max width {m.group(1).replace(',', '.')} m"
-    m = re.search(r"maxweight\s*([\d.,]+)", t)
-    if m: return f"Max weight {m.group(1).replace(',', '.')} t"
-    mapping = {
-        "hgv=no": "No HGVs",
-        "hgv=destination": "HGVs — destination only",
-        "access=no": "No public access",
-        "access=private": "Private access road",
-        "oneway": "One-way",
-    }
-    return mapping.get(t, t.replace("=", " = "))
-
-def restriction_notes(ways)->List[str]:
-    TANKER = {"max_height_m": 3.6, "max_width_m": 2.55, "gross_weight_t": 18.0}
-    out=[]
+def restriction_notes(ways, vehicle) -> List[str]:
+    out = []
     for w in ways:
-        t=w.get("tags",{})
-        h=parse_num(t.get("maxheight")); wdt=parse_num(t.get("maxwidth")); wt=parse_num(t.get("maxweight"))
-        if h is not None and h<TANKER["max_height_m"]: out.append(f"maxheight {h} m")
-        if wdt is not None and wdt<TANKER["max_width_m"]: out.append(f"maxwidth {wdt} m")
-        if wt is not None and wt<TANKER["gross_weight_t"]: out.append(f"maxweight {wt} t")
-        if (t.get("hgv") or "").lower() in ("no","destination"): out.append(f"hgv={t.get('hgv').lower()}")
-        if (t.get("access") or "").lower() in ("no","private"): out.append(f"access={t.get('access').lower()}")
-        if (t.get("oneway") or "").lower()=="yes": out.append("oneway")
-    seen=set(); out2=[]
+        t = w.get("tags", {})
+        h = parse_num(t.get("maxheight"))
+        wdt = parse_num(t.get("maxwidth"))
+        wt = parse_num(t.get("maxweight"))
+        if (h is not None) and (h < vehicle["max_height_m"]): out.append(f"Max height {h} m")
+        if (wdt is not None) and (wdt < vehicle["max_width_m"]): out.append(f"Max width {wdt} m")
+        if (wt is not None) and (wt < vehicle["gross_weight_t"]): out.append(f"Max weight {wt} t")
+        if (t.get("hgv") or "").lower() in ("no","destination"): out.append(f"HGV {t.get('hgv').lower()}")
+        if (t.get("access") or "").lower() in ("no","private"): out.append(f"Access {t.get('access').lower()}")
+        if (t.get("oneway") or "").lower() == "yes": out.append("One-way")
+    # unique
+    seen, out2 = set(), []
     for s in out:
-        if s not in seen: seen.add(s); out2.append(s)
+        if s not in seen:
+            seen.add(s)
+            out2.append(s)
     return out2
 
-def surface_info(ways)->Dict:
-    risky=0; samples=[]
+def surface_info(ways) -> Dict:
+    risky = 0; samples = []
     for w in ways:
-        t=w.get("tags",{})
-        surf=(t.get("surface") or "").lower()
-        smooth=(t.get("smoothness") or "").lower()
-        if any(k in surf for k in ("gravel","ground","dirt","grass","unpaved","compacted","sand")): risky+=1
-        if any(k in smooth for k in ("bad","very_bad","horrible","impassable")): risky+=1
+        t = w.get("tags", {})
+        surf = (t.get("surface") or "").lower()
+        smooth = (t.get("smoothness") or "").lower()
+        if any(k in surf for k in ("gravel","ground","dirt","grass","unpaved","compacted","sand")): risky += 1
+        if any(k in smooth for k in ("bad","very_bad","horrible","impassable")): risky += 1
         if surf or smooth: samples.append(f"{surf or 'n/a'}/{smooth or 'n/a'}")
-    return {"risky_count":risky,"samples":samples[:8]}
+    return {"risky_count": risky, "samples": samples[:8]}
 
-def flood_risk(feats, slope, elev)->Dict:
-    d=feats.get("d_water_m"); g=slope.get("grade_pct") or 0.0; z=elev or 0.0
-    level="Low"; why=[]
-    if d is None: why.append("No mapped watercourse nearby")
+def parse_osm(lat0, lon0, data) -> Dict:
+    bpolys, roads, drains, manholes, plines, pnodes, rails, wlines, wpolys, land_polys = [],[],[],[],[],[],[],[],[],[]
+    rest_ways, surf_ways = [],[]
+
+    for el in data.get("elements", []):
+        t = el.get("type"); tags = el.get("tags", {}) or {}
+        geom = el.get("geometry"); coords = [(g["lat"], g["lon"]) for g in (geom or [])]
+
+        if tags.get("building") and t in ("way","relation"): bpolys.append(coords)
+        elif tags.get("highway") and t == "way":
+            roads.append(coords)
+            if any(k in tags for k in ("maxheight","maxwidth","maxweight","hgv","access","oneway")):
+                rest_ways.append({"tags":tags, "coords":coords})
+            if ("surface" in tags) or ("smoothness" in tags):
+                surf_ways.append({"tags":tags, "coords":coords})
+        elif t == "way" and (tags.get("waterway") == "drain" or tags.get("tunnel") == "culvert"): drains.append(coords)
+        elif t == "node" and (tags.get("man_made") == "manhole" or "manhole" in tags): manholes.append((el.get("lat"), el.get("lon")))
+        elif t == "way" and tags.get("power") == "line": plines.append(coords)
+        elif t == "node" and tags.get("power") in ("tower","pole"): pnodes.append((el.get("lat"), el.get("lon")))
+        elif t == "way" and tags.get("railway") and tags.get("railway") not in ("abandoned","disused"): rails.append(coords)
+        elif t == "way" and tags.get("waterway") in ("river","stream","ditch"): wlines.append(coords)
+        elif t == "way" and tags.get("natural") == "water": wpolys.append(coords)
+        elif t in ("way","relation") and tags.get("landuse"): land_polys.append({"tag":tags.get("landuse"), "coords":coords})
+
+    # Defensive filtering (prevents TypeErrors)
+    valid_bpolys = [p for p in bpolys if p and len(p) >= 2]
+    valid_roads  = [l for l in roads  if l and len(l) >= 2]
+    valid_drains = [l for l in drains if l and len(l) >= 2]
+    valid_plines = [l for l in plines if l and len(l) >= 2]
+    valid_rails  = [l for l in rails  if l and len(l) >= 2]
+    valid_wlines = [l for l in wlines if l and len(l) >= 2]
+    valid_wpolys = [p for p in wpolys if p and len(p) >= 2]
+
+    d_build = min([dist_poly(lat0, lon0, p) for p in valid_bpolys] or [None])
+    d_road  = min([dist_line(lat0, lon0, l) for l in valid_roads] or [None])
+    d_drain = min(([dist_line(lat0, lon0, l) for l in valid_drains] +
+                   ([dist_line(lat0, lon0, [(la,lo),(la,lo)]) for la,lo in manholes] if manholes else [])) or [None])
+    d_over  = min(([dist_line(lat0, lon0, l) for l in valid_plines] +
+                   ([dist_line(lat0, lon0, [(la,lo),(la,lo)]) for la,lo in pnodes] if pnodes else [])) or [None])
+    d_rail  = min([dist_line(lat0, lon0, l) for l in valid_rails] or [None])
+    d_water = min(([dist_line(lat0, lon0, l) for l in valid_wlines] +
+                   [dist_poly(lat0, lon0, p) for p in valid_wpolys]) or [None])
+
+    land_counts = {}
+    for lp in land_polys:
+        tag = lp["tag"]; land_counts[tag] = land_counts.get(tag, 0) + 1
+    if land_counts:
+        top = max(land_counts, key=lambda k: land_counts[k])
+        if top in ("residential","commercial","retail"): land_class = "Domestic/Urban"
+        elif top in ("industrial","industrial;retail"):   land_class = "Industrial"
+        else: land_class = "Rural/Agricultural"
     else:
-        if d<50: level="High"; why.append(f"Watercourse within {d} m")
-        elif d<150: level="Medium"; why.append(f"Watercourse at {d} m")
-        else: why.append(f"Watercourse at {d} m")
-    if g>=6: why.append(f"Steep local slope {g}% (runoff/flow)")
-    if z and z<10: why.append(f"Low elevation {int(z)} m a.s.l.")
-    return {"level":level, "why":why}
+        land_class = "Domestic/Urban" if len(valid_bpolys) > 80 else ("Rural/Agricultural" if len(valid_bpolys) < 20 else "Mixed")
 
-# ──────────────────────────────────────────────────────────────
-# Risk & AI
-# ──────────────────────────────────────────────────────────────
-def risk_score(feats, wind, slope, appr, rr, notes, surf, flood, answers=None, cfg=None)->Dict:
-    answers = answers or {}
-    cfg = cfg or CFG
-    CoP = cfg["cop"]; W = cfg["weights"]; B = cfg["bands"]
-    score=0.0; why=[]
-    def add(x,msg): nonlocal score; score+=float(x); why.append((float(x),msg))
-    def _safe_dist(x):
-        if x is None: return None
-        try: x=float(x)
-        except: return None
-        return x if x>0 else None
-    def penal(dist, lim, w, label=None):
-        if dist is None or lim is None: return
-        try: lim=float(lim)
-        except: return
-        if dist>=lim: return
-        if isinstance(w,(int,float)):
-            add(w, f"{label or 'Below limit'} {lim} m (≈ {dist:.1f} m)"); return
-        base, per_m, cap = w.get("base",0), w.get("per_m",0), w.get("cap",100)
-        pts=min(cap, base + per_m*(lim-dist)); add(pts, f"{label or 'Below limit'} {lim} m (≈ {dist:.1f} m)")
+    # First road line (for approach grade sampling; optional)
+    nearest_road_line = valid_roads[0] if valid_roads else None
 
-    bld  = _safe_dist(feats.get("d_building_m"))
-    shed = _safe_dist(feats.get("d_outbuilding_m"))
-    eff_build = bld if shed is None else (shed if bld is None else min(bld,shed))
-    penal(eff_build, CoP.get("to_building_m"), W.get("building"), "Below 3.0 m (≈")
-    penal(_safe_dist(feats.get("d_boundary_m")), CoP.get("to_boundary_m"), W.get("boundary"), "Boundary <")
-    penal(_safe_dist(feats.get("d_road_m")),  CoP.get("to_ignition_m"), W.get("ignition"), "Ignition proxy <")
-    penal(_safe_dist(feats.get("d_drain_m")), CoP.get("to_drain_m"),    W.get("drain"), "Drain/manhole <")
+    return {
+        "d_building_m": None if d_build is None else round(d_build, 1),
+        "d_road_m":     None if d_road  is None else round(d_road, 1),
+        "d_drain_m":    None if d_drain is None else round(d_drain, 1),
+        "d_overhead_m": None if d_over  is None else round(d_over, 1),
+        "d_rail_m":     None if d_rail  is None else round(d_rail, 1),
+        "d_water_m":    None if d_water is None else round(d_water, 1),
+        "land_class": land_class,
+        "restrictions": rest_ways,
+        "surfaces":     surf_ways,
+        "nearest_road_line": nearest_road_line,
+    }
 
-    ov=_safe_dist(feats.get("d_overhead_m"))
-    if ov is not None and ov < CoP["overhead_block_m"]:
-        add(W.get("overhead_block",28), "Overhead power lines in no-go band")
-    elif ov is not None and ov < CoP["overhead_info_m"]:
-        add(W.get("overhead_info",10), "Overhead power lines in info band")
+# -------------------------
+# Map box (static) with rings
+# -------------------------
+def fetch_map(lat, lon, zoom=17, size=(1000, 750)):
+    if not MAPBOX_TOKEN:
+        return None
+    try:
+        w, h = size
+        marker = f"pin-l+f30({lon},{lat})"; style = "light-v11"
+        url = (f"https://api.mapbox.com/styles/v1/mapbox/{style}/static/"
+               f"{marker}/{lon},{lat},{zoom},0/{w}x{h}?access_token={MAPBOX_TOKEN}")
+        r = requests.get(url, timeout=15); r.raise_for_status()
+        img = Image.open(io.BytesIO(r.content)).convert("RGBA")
+        return img
+    except Exception:
+        return None
 
-    rail=_safe_dist(feats.get("d_rail_m"))
-    if rail is not None and rail < CoP["rail_attention_m"]:
-        add(W.get("rail_near",10), f"Railway within {CoP['rail_attention_m']} m")
+def overlay_rings(img: Image.Image, lat, zoom=17):
+    if img is None: return None
+    def mpp(lat,zoom): return 156543.03392*math.cos(math.radians(lat))/(2**zoom)
+    scale = mpp(lat,zoom)
+    cx, cy = img.width//2, img.height//2
+    d = ImageDraw.Draw(img, "RGBA")
+    for r, col in ((3,(220,0,0,180)), (6,(255,140,0,160))):
+        px = max(1, int(r/scale))
+        d.ellipse((cx-px,cy-px,cx+px,cy+px), outline=col, width=4)
+    return img
 
-    wat=_safe_dist(feats.get("d_water_m"))
-    if wat is not None and wat < 50: add(W.get("water_near",8), "Watercourse within 50 m")
+def make_map_card(words, lat, lon):
+    img = fetch_map(lat,lon)
+    if img is None:
+        # placeholder
+        img = Image.new("RGBA",(1000,750),(245,247,250,255))
+        d = ImageDraw.Draw(img)
+        d.text((20,20),"Map unavailable", fill=(80,80,80))
+    img = overlay_rings(img, lat, 17)
+    out = f"map_{words.replace('.','_')}.png"
+    img.save(out)
+    return out
 
-    # NEW: open field proximity
-    of=_safe_dist(feats.get("d_open_field_m"))
-    if of is not None:
-        if of < 10: add(W["open_field_lt10"], "Open field/farmland within 10 m")
-        elif of < 30: add(W["open_field_lt30"], "Open field/farmland within 30 m")
+# -------------------------
+# Streamlit UI helpers
+# -------------------------
+st.set_page_config(page_title="LPG Pre-Check", page_icon="icon.png", layout="wide")
+if "auth_ok" not in st.session_state:
+    st.session_state.auth_ok = False
 
-    spd=wind.get("speed_mps")
-    if spd is not None and spd<CoP["wind_stagnant_mps"]: add(W.get("low_wind",6), f"Low wind {spd:.1f} m/s")
+def header_with_icon(title: str):
+    c1, c2 = st.columns([0.08, 0.92])
+    with c1:
+        try:
+            img = Image.open("icon.png")
+            st.image(img, use_container_width=True)
+        except Exception:
+            st.write("")
+    with c2:
+        st.title(title)
 
-    g=slope.get("grade_pct")
-    if g is not None and g>=6: add(W.get("slope_ge6",12), f"Local slope {g:.1f}%")
-    elif g is not None and g>=CoP["slope_attention_pct"]: add(W.get("slope_ge3",8), f"Local slope {g:.1f}%")
+def auth_gate():
+    header_with_icon("LPG Pre-Check — Access")
+    st.caption("Step 1: Enter the access password to continue.")
+    pwd = st.text_input("Password", type="password", placeholder="Enter password…")
+    if st.button("Unlock", type="primary"):
+        if pwd == APP_PASSWORD:
+            st.session_state.auth_ok = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    st.stop()
 
-    if appr.get("max_pct") is not None and appr["max_pct"]>=CoP["approach_grade_warn_pct"]:
-        add(W.get("approach_steep",12), f"Steep approach (max {appr['max_pct']}%)")
+if not st.session_state.auth_ok:
+    auth_gate()
 
-    if rr is not None and rr>CoP["route_vs_crowfly_ratio_warn"]:
-        add(W.get("route_detour",10), f"Route ≫ crow-fly ({rr:.2f}×)")
+header_with_icon(APP_TITLE)
 
-    if notes:
-        nice = [humanize_restriction(n) for n in notes]
-        add(min(12, 4*len(notes)),"Access restrictions: "+", ".join(nice))
+# -------------------------
+# Sidebar controls
+# -------------------------
+with st.sidebar:
+    st.subheader("Location")
+    words = st.text_input("what3words (word.word.word)", value=st.session_state.get("w3w",""))
+    vehicle_name = st.selectbox("Vehicle", list(VEHICLES.keys()), index=list(VEHICLES.keys()).index(DEFAULT_VEHICLE))
+    run = st.button("Run Pre-Check", type="primary", use_container_width=True)
 
-    if surf.get("risky_count",0)>0:
-        add(min(10, W.get("surface_flag_per",2)*surf['risky_count']), f"Surface flags={surf['risky_count']}")
+# -------------------------
+# Fetch auto data
+# -------------------------
+auto = {}
+lat = lon = None
+addr = {}
+if run and words.strip():
+    with st.status("Fetching site data…", expanded=True) as status:
+        la, lo = w3w_to_latlon(words.strip().lstrip("/"))
+        if la is None:
+            st.error("what3words lookup failed."); st.stop()
+        lat, lon = la, lo
+        status.update(label="Reverse geocoding…")
+        addr = reverse_geocode(lat, lon)
+        status.update(label="Reading OSM features…")
+        osm = overpass(lat, lon, int(CoP["poi_radius_m"]))
+        feats = parse_osm(lat, lon, osm)
+        # simple environment placeholders (wire real services if you wish)
+        auto = {
+            "building_m": feats["d_building_m"],
+            "boundary_m": None,  # user-provided
+            "road_m": feats["d_road_m"],
+            "drain_m": feats["d_drain_m"],
+            "overhead_m": feats["d_overhead_m"],
+            "rail_m": feats["d_rail_m"],
+            "water_m": feats["d_water_m"],
+            "land_class": feats["land_class"],
 
-    if answers.get("onsite_ignitions") is True: add(W.get("excel_ignitions_3m",6), "On-site ignition within 3 m (user)")
-    stype=(answers.get("surface_type") or "").lower()
-    if stype in ("gravel","grass"): add(min(10, W.get("surface_flag_per",2)*2), f"Soft surface: {stype}")
-    fs = int(answers.get("fence_sides",0) or 0)
-    if fs>0: add(min(12, W.get("fence_side",4)*fs), f"Enclosure effect: {fs} solid side(s)")
-    if answers.get("los_restricted") is True: add(W.get("los_restricted",8), "Restricted line-of-sight at stand")
+            "wind_mps": 6.8, "wind_deg": 191, "slope_pct": 3.5,
+            "approach_avg": 0.9, "approach_max": 3.5,
+            "rr": None,
 
-    # Vegetation slider (linear 0..8)
-    pct = int(answers.get("veg_within3m_pct", 0) or 0)
-    if pct > 0:
-        add(min(CFG["weights"]["veg_ring_linear_cap"], round(CFG["weights"]["veg_ring_linear_cap"] * pct / 100.0, 1)),
-            f"Vegetation within 3 m ({pct}%)")
-
-    # Notes nudge
-    if (answers.get("vegetation_notes") or "").strip():
-        add(W.get("vegetation",6), "Vegetation/combustible build-up")
-
-    score=round(min(100.0,max(0.0,score)),1)
-    status="PASS" if score<B["pass_lt"] else ("ATTENTION" if score<B["attention_lt"] else "BLOCKER")
-    why.sort(key=lambda x:-x[0])
-    return {"score":score,"status":status,"explain":why}
-
-def ai_sections(context: Dict) -> Dict[str,str]:
-    def offline(ctx: Dict) -> Dict[str,str]:
-        feats,wind,slope,appr,rr,flood,risk = (ctx.get(k,{}) for k in
-            ["features","wind","slope","approach","route_ratio","flood","risk"])
-        S1 = (
-            f"The local slope is {slope.get('grade_pct','?')}% (aspect {int((slope.get('aspect_deg') or 0))}°). "
-            f"Key separations (m): building {feats.get('d_building_m')}, shed/structure {feats.get('d_outbuilding_m')}, "
-            f"boundary {feats.get('d_boundary_m')}, road {feats.get('d_road_m')}, drain {feats.get('d_drain_m')}, "
-            f"overhead power lines {feats.get('d_overhead_m')}, rail {feats.get('d_rail_m')}, open field {feats.get('d_open_field_m')}. "
-            f"Wind {(wind.get('speed_mps') or 0):.1f} m/s from {wind.get('compass') or 'n/a'}. "
-            f"Heuristic {risk.get('score','?')}/100 → {risk.get('status','?')}. Drivers: "
-            + "; ".join([f"{int(p)} {m}" for p, m in (risk.get('explain') or [])[:4]]) + "."
-        )
-        S2 = (
-            f"Flood {flood.get('level','n/a')} ({'; '.join(flood.get('why',[]))}). "
-            f"Protect drains during transfers; land use {feats.get('land_class','n/a')}."
-        )
-        S3 = (
-            f"Approach avg/max {appr.get('avg_pct','?')}/{appr.get('max_pct','?')}%. "
-            + (f"Route indirectness {rr:.2f}× crow-fly. " if rr else "")
-            + "Validate signage/restrictions; provide sound hardstanding and clear sightlines."
-        )
-        S4 = ("Site appears suitable with routine controls." if risk.get('status')=='PASS'
-              else "Attention required: confirm separations, ignition control, drainage protection, safe approach/egress.")
-        return {
-            "Safety Risk Profile": S1, "Environmental Considerations": S2,
-            "Access & Logistics": S3, "Overall Site Suitability": S4,
+            "restrictions": feats["restrictions"],
+            "surfaces": feats["surfaces"],
         }
+        st.session_state["w3w"] = words.strip()
+        st.session_state["auto"] = auto
+        st.session_state["addr"] = addr
+        st.session_state["latlon"] = (lat, lon)
+        st.session_state["vehicle"] = vehicle_name
+        status.update(label="Auto data ready.", state="complete")
+
+# Use cached
+auto = st.session_state.get("auto", {})
+addr = st.session_state.get("addr", {})
+latlon = st.session_state.get("latlon", (None,None))
+lat, lon = latlon
+vehicle_name = st.session_state.get("vehicle", DEFAULT_VEHICLE)
+vehicle = VEHICLES[vehicle_name]
+
+# -------------------------
+# Form widgets
+# -------------------------
+def distance_field(label: str, key_prefix: str, auto_val: Optional[float], max_val=2000.0) -> Optional[float]:
+    col_val, col_unknown = st.columns([0.9, 0.1])
+    with col_unknown:
+        unknown = st.checkbox("Not mapped", key=f"{key_prefix}_unknown", value=(auto_val is None))
+    with col_val:
+        disabled = unknown
+        v0 = 0.0 if auto_val is None else float(auto_val)
+        value = st.number_input(label, min_value=0.0, max_value=float(max_val), step=0.1, value=v0, disabled=disabled, key=f"{key_prefix}_val")
+    return None if unknown else float(value)
+
+st.markdown("### Edit & confirm")
+with st.form("inputs"):
+    st.subheader("Environment & approach")
+    e1, e2, e3 = st.columns(3)
+    with e1:
+        wind_mps = st.number_input("Wind (m/s)", min_value=0.0, max_value=60.0, step=0.1, value=float(auto.get("wind_mps", 0.0)))
+    with e2:
+        wind_deg = st.number_input("Wind dir (°)", min_value=0, max_value=359, step=1, value=int(auto.get("wind_deg", 0)))
+    with e3:
+        slope_pct = st.number_input("Slope (%)", min_value=0.0, max_value=100.0, step=0.1, value=float(auto.get("slope_pct", 0.0)))
+
+    a1, a2, a3 = st.columns(3)
+    with a1:
+        approach_avg = st.number_input("Approach avg (%)", min_value=0.0, max_value=100.0, step=0.1, value=float(auto.get("approach_avg", 0.0)))
+    with a2:
+        approach_max = st.number_input("Approach max (%)", min_value=0.0, max_value=100.0, step=0.1, value=float(auto.get("approach_max", 0.0)))
+    with a3:
+        rr_default = "" if auto.get("rr") is None else f"{auto['rr']:.2f}"
+        rr_str = st.text_input("Route indirectness (× crow-fly) — optional", value=rr_default, placeholder="leave blank")
+        try:
+            route_ratio = float(rr_str) if rr_str.strip() else None
+        except:
+            route_ratio = None
+
+    st.markdown("---")
+    st.subheader("Separations (~400 m)")
+
+    s1, s2 = st.columns(2)
+    with s1:
+        building_m = distance_field("Building (m)", "d_building_m", auto.get("building_m"))
+        road_m     = distance_field("Road/footpath (m)", "d_road_m", auto.get("road_m"))
+        overhead_m = distance_field("Overhead power lines (m)", "d_overhead_m", auto.get("overhead_m"))
+        water_m    = distance_field("Watercourse (m)", "d_water_m", auto.get("water_m"))
+    with s2:
+        boundary_m = distance_field("Boundary (m)", "d_boundary_m", auto.get("boundary_m"))
+        drain_m    = distance_field("Drain/manhole (m)", "d_drain_m", auto.get("drain_m"))
+        rail_m     = distance_field("Railway (m)", "d_rail_m", auto.get("rail_m"))
+        land_use   = st.selectbox("Land use", ["Domestic/Urban","Industrial","Mixed","Rural/Agricultural"], index=["Domestic/Urban","Industrial","Mixed","Rural/Agricultural"].index(auto.get("land_class","Domestic/Urban")))
+
+    st.markdown("---")
+    st.subheader("Site options")
+    v1, v2 = st.columns([0.4,0.6])
+    with v1:
+        veg_3m = st.slider("Vegetation within 3 m of tank (0 none → 3 heavy)", 0, 3, 1)
+        los_issue = st.checkbox("Restricted line-of-sight at stand", value=False)
+    with v2:
+        notes_txt = st.text_input("Notes (vegetation / sightlines / special instructions)", value="")
+
+    submitted = st.form_submit_button("Confirm & assess", type="primary")
+
+# -------------------------
+# Risk scoring
+# -------------------------
+def risk_score(values: Dict, access: Dict, veg_3m: int, los_issue: bool) -> Dict:
+    score = 0.0; why = []
+
+    def add(x, msg): 
+        nonlocal score; score += x; why.append(msg)
+
+    def penal(dist, lim, msg, base=18, per=6, cap=40):
+        if dist is None or dist >= lim: return
+        pts = min(cap, base + per*(lim - dist)); add(pts, f"{msg} below {lim} m (≈ {dist:.1f} m)")
+
+    penal(values["building_m"], CoP["to_building_m"], "Below 3.0 m")
+    penal(values["road_m"],     CoP["to_ignition_m"], "Ignition proxy (road/footpath)")
+    penal(values["drain_m"],    CoP["to_drain_m"],    "Drain/manhole <3 m")
+
+    d_ov = values["overhead_m"]
+    if d_ov is not None and d_ov < CoP["overhead_block_m"]: add(28,"Overhead in no-go band")
+    elif d_ov is not None and d_ov < CoP["overhead_info_m"]: add(10,"Overhead within 10 m")
+
+    d_rail = values["rail_m"]
+    if d_rail is not None and d_rail < CoP["rail_attention_m"]: add(10,"Railway within 30.0 m")
+    if values["water_m"] is not None and values["water_m"] < 50: add(8,"Watercourse within 50 m")
+
+    if values["wind_mps"] is not None and values["wind_mps"] < CoP["wind_stagnant_mps"]: add(6,f"Low wind {values['wind_mps']:.1f} m/s")
+    if values["slope_pct"] is not None and values["slope_pct"] >= CoP["slope_attention_pct"]: add(8, f"Local slope {values['slope_pct']:.1f}%")
+    if values["approach_max"] is not None and values["approach_max"] >= CoP["approach_grade_warn_pct"]: add(12,f"Steep approach (max {values['approach_max']:.1f}%)")
+    if values["route_ratio"] is not None and values["route_ratio"] > CoP["route_vs_crowfly_ratio_warn"]: add(10, f"Route length ≫ crow-fly ({values['route_ratio']:.2f}×)")
+
+    if veg_3m >= 2: add(6,"Vegetation near tank (≤3 m)")
+    if los_issue: add(8,"Restricted line-of-sight at stand")
+
+    # Access flags
+    if access["notes"]: add(min(12, 4*len(access["notes"])), "Access restrictions: "+", ".join(access["notes"]))
+    if access["surface"]["risky_count"]>0: add(min(10,2*access["surface"]['risky_count']), f"Surface flags={access['surface']['risky_count']}")
+
+    score = round(min(100.0, score), 1)
+    status = "PASS" if score < 20 else ("ATTENTION" if score < 50 else "BLOCKER")
+    return {"score":score,"status":status,"explain":why[:7]}
+
+def make_controls(rs_status: str) -> List[str]:
+    out = [
+        "Use a trained banksman during manoeuvres and reversing.",
+        "Add temporary cones/signage; consider a convex mirror or visibility aids.",
+        "Plan approach/egress to avoid reversing where practicable."
+    ]
+    if rs_status != "PASS":
+        out.append("Confirm separations to CoP1; protect drains/manholes within 3 m; manage vegetation.")
+    return out
+
+# -------------------------
+# AI commentary (optional online; offline fallback)
+# -------------------------
+def ai_sections(context: Dict) -> Dict[str,str]:
+    offline = {
+        "Safety Risk Profile": f"Local slope {context['slope_pct']:.1f}% (aspect not derived). Key separations (m): "
+                               f"bldg {context['building_m'] or 'n/a'}, boundary {context['boundary_m'] or 'n/a'}, "
+                               f"road {context['road_m'] or 'n/a'}, drain {context['drain_m'] or 'n/a'}, "
+                               f"overhead {context['overhead_m'] or 'n/a'}, rail {context['rail_m'] or 'n/a'}. "
+                               f"Wind {context['wind_mps']:.1f} m/s from {context['wind_deg']}°. Heuristic "
+                               f"{context['risk']['score']}/100 → {context['risk']['status']}.",
+        "Environmental Considerations": f"Flood Low/unknown (watercourse ~{context['water_m'] or 'n/a'} m). "
+                               "Protect drains during transfers; control vegetation.",
+        "Access & Logistics": f"Approach avg/max {context['approach_avg']:.1f}/{context['approach_max']:.1f}%. "
+                               "Validate signage/restrictions; ensure sound hardstanding.",
+        "Overall Site Suitability": "Site appears suitable with routine controls where PASS; when ATTENTION/BLOCKER, "
+                                    "address separations, overheads, drains, and sightlines before delivery.",
+    }
     if not OPENAI_API_KEY:
-        return offline(context)
+        return offline
+
     try:
         prompt = f"""
-You are an expert LPG site assessor. Using the context JSON, write professional narrative commentary.
-Use four sections exactly:
+Act as an LPG siting assessor. Write four concise sections:
 [1] Safety Risk Profile
 [2] Environmental Considerations
 [3] Access & Logistics
 [4] Overall Site Suitability
-2–4 sentences per section; numeric where relevant; include practical actions.
+Use the numeric context below and keep practical/operational tone (≈120–180 words per section).
 
 Context JSON:
 {json.dumps(context, ensure_ascii=False)}
@@ -607,550 +563,226 @@ Context JSON:
         r = requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type":"application/json"},
-            json={"model":"gpt-4o-mini","temperature":0.25,"max_tokens":1100,
+            json={"model":"gpt-4o-mini","temperature":0.3,"max_tokens":900,
                   "messages":[{"role":"system","content":"You are an LPG safety and logistics assessor."},
                               {"role":"user","content":prompt}]},
             timeout=45
         )
         if r.status_code != 200:
-            return offline(context)
+            return offline
         text = r.json()["choices"][0]["message"]["content"].strip()
         sections = {"Safety Risk Profile":"","Environmental Considerations":"","Access & Logistics":"","Overall Site Suitability":""}
-        current=None; mapping={"[1]":"Safety Risk Profile","[2]":"Environmental Considerations","[3]":"Access & Logistics","[4]":"Overall Site Suitability"}
+        current = None
+        mapping = {"[1]":"Safety Risk Profile","[2]":"Environmental Considerations","[3]":"Access & Logistics","[4]":"Overall Site Suitability"}
         for line in text.splitlines():
-            t=line.strip()
-            for key,name in mapping.items():
-                if t.startswith(key):
-                    current=name; t=t[len(key):].strip(":- \t")
-                    if t: sections[current]+=t+"\n"; break
+            t = line.strip()
+            for k,name in mapping.items():
+                if t.startswith(k):
+                    current = name
+                    t = t[len(k):].lstrip(":- \t")
+                    if t: sections[current] += t + "\n"
+                    break
             else:
-                if current: sections[current]+=t+"\n"
-        clean={}; fb=offline(context)
-        for k,v in sections.items():
-            lines=[ln.rstrip() for ln in (v or "").splitlines()]
-            while lines and not lines[0].strip(): lines.pop(0)
-            clean[k]="\n".join(lines).strip() or fb[k]
-        return clean
+                if current: sections[current] += t + "\n"
+        # fallback if any empty
+        for k in sections:
+            if not sections[k].strip(): sections[k] = offline[k]
+        return sections
     except Exception:
-        return offline(context)
+        return offline
 
-def _to_ns(obj):
-    if isinstance(obj, dict): return SimpleNamespace(**{k: _to_ns(v) for k, v in obj.items()})
-    return obj
-def _eval_when(expr: str, ctx: dict) -> bool:
-    try:
-        env = {
-            "answers":  _to_ns(ctx.get("answers", {})),
-            "features": _to_ns(ctx.get("features", {})),
-            "cop":      _to_ns(CFG["cop"]),
-            "wind":     _to_ns(ctx.get("wind", {})),
-            "slope":    _to_ns(ctx.get("slope", {})),
-            "approach": _to_ns(ctx.get("approach", {})),
-            "risk":     _to_ns(ctx.get("risk", {})),
-        }
-        return bool(eval(expr, {"__builtins__": {}}, env))
-    except Exception:
-        return False
+# -------------------------
+# PDF report
+# -------------------------
+def build_pdf(words, addr, lat, lon, values, rs, breakdown, controls, ai, map_png) -> str:
+    W, H = A4; M = 38; LEAD = 12; y = H - 46; PAGE_BOTTOM = 40
+    blue = colors.HexColor("#1f4e79"); grey = colors.HexColor("#555555")
+    out = f"precheck_{words.replace('.','_')}.pdf"
+    c = rl_canvas.Canvas(out, pagesize=A4)
 
-# Map helpers (for PDF + UI)
-def fetch_map(lat, lon, zoom=17, size=(900, 600)):
-    if not MAPBOX_TOKEN: return None
-    try:
-        w,h=size
-        marker=f"pin-l+f30({lon},{lat})"; style="light-v11"
-        url=(f"https://api.mapbox.com/styles/v1/mapbox/{style}/static/"
-             f"{marker}/{lon},{lat},{zoom},0/{w}x{h}?access_token={MAPBOX_TOKEN}")
-        r=requests.get(url,timeout=15); r.raise_for_status()
-        return r.content
-    except Exception:
-        return None
-def overlay_rings(img_bytes, lat, zoom=17):
-    try:
-        from PIL import Image, ImageDraw
-    except Exception:
-        return img_bytes
-    try:
-        img=Image.open(io.BytesIO(img_bytes)).convert("RGBA")
-        def mpp(lat,zoom): return 156543.03392*math.cos(math.radians(lat))/(2**zoom)
-        scale=mpp(lat,zoom); cx,cy=img.width//2,img.height//2; d=ImageDraw.Draw(img,"RGBA")
-        for r,col in ((3,(220,0,0,180)),(6,(255,140,0,160))):
-            px=max(1,int(r/scale)); d.ellipse((cx-px,cy-px,cx+px,cy+px),outline=col,width=4)
-        out=io.BytesIO(); img.save(out, format="PNG"); return out.getvalue()
-    except Exception:
-        return img_bytes
-
-# PDF
-def build_pdf_bytes(ctx: dict) -> bytes:
-    try:
-        from reportlab.pdfgen import canvas
-        from reportlab.lib.pagesizes import A4
-        from reportlab.lib import colors
-        from reportlab.lib.utils import ImageReader
-        from reportlab.pdfbase import pdfmetrics
-    except Exception:
-        return b""
-
-    feats=ctx["features"]; wind=ctx["wind"]; slope=ctx["slope"]; appr=ctx["approach"]
-    rr=ctx["route_ratio"]; flood=ctx["flood"]; risk=ctx["risk"]
-    addr=ctx["address"]; la_name=ctx.get("authority"); hospital=ctx.get("hospital") or {}
-    ai=ctx.get("ai") or {}; controls=ctx.get("controls") or []
-    answers=ctx.get("answers") or {}; vehicle=ctx.get("vehicle") or {}
-    notes=ctx.get("restrictions") or []; surf=ctx.get("surfaces") or {}
-    map_png=ctx.get("map_png")
-
-    buff=io.BytesIO(); c=canvas.Canvas(buff, pagesize=A4)
-    W,H=A4; M=38; y=H-46; LEAD=12
-    blue=colors.HexColor("#1f4e79"); grey=colors.HexColor("#666")
-
+    def new_page():
+        nonlocal y; c.showPage(); y = H - 46
     def ensure(h):
+        nonlocal y; 
+        if y - h < PAGE_BOTTOM: new_page()
+    def text_line(txt, col=colors.black, font="Helvetica", size=10):
+        nonlocal y; ensure(size+3); c.setFillColor(col); c.setFont(font,size); c.drawString(M,y,txt); y -= (size+3); c.setFillColor(colors.black)
+    def header(txt, size=16, col=blue):
+        nonlocal y; ensure(size+6); c.setFillColor(col); c.setFont("Helvetica-Bold", size); c.drawString(M,y,txt); y -= (size+6); c.setFillColor(colors.black)
+    def section(txt, size=12, col=blue):
+        nonlocal y; ensure(size+8); y -= 4; c.setFillColor(col); c.setFont("Helvetica-Bold", size); c.drawString(M,y,txt); y -= (size+2); c.setFillColor(colors.black)
+    def wrap_paragraph(text, width=W-2*M, font="Helvetica", size=10, leading=LEAD):
+        nonlocal y; c.setFont(font,size)
+        for para in text.split("\n"):
+            para = para.rstrip()
+            if not para: ensure(leading); y -= leading; continue
+            words = para.split(); line=""
+            for w in words:
+                test = (line+" "+w).strip() if line else w
+                if pdfmetrics.stringWidth(test, font, size) <= width: line = test
+                else: ensure(leading); c.drawString(M,y,line); y -= leading; line = w
+            if line: ensure(leading); c.drawString(M,y,line); y -= leading
+    def bullet_list(items, bullet="•", font="Helvetica", size=10, leading=LEAD):
         nonlocal y
-        if y-h<40: c.showPage(); y=H-46
-    def header_line(txt, size=16):
-        nonlocal y; ensure(size+6); c.setFillColor(blue); c.setFont("Helvetica-Bold", size); c.drawString(M, y, txt); y -= size+6; c.setFillColor(colors.black)
-    def text_line(txt, size=10, col=colors.black):
-        nonlocal y; ensure(size+3); c.setFillColor(col); c.setFont("Helvetica", size); c.drawString(M, y, txt); y -= size+3; c.setFillColor(colors.black)
-    def wrap(txt, size=10):
-        nonlocal y
-        width=W-2*M; c.setFont("Helvetica", size)
-        for para in (txt or "").split("\n"):
-            para=para.rstrip()
-            if not para:
-                ensure(LEAD); y-=LEAD; continue
-            cur=""
-            for w in para.split():
-                test=(cur+" "+w).strip() if cur else w
-                if pdfmetrics.stringWidth(test,"Helvetica",size)<=width: cur=test
-                else: ensure(LEAD); c.drawString(M,y,cur); y-=LEAD; cur=w
-            if cur: ensure(LEAD); c.drawString(M,y,cur); y-=LEAD
-    def bullet(items, size=10):
-        for it in items or []: text_line(f"• {it}", size=size)
+        for it in (items or []):
+            s = f"{bullet} {it}"; ensure(leading); c.setFont(font,size); c.drawString(M,y,s); y -= leading
 
-    # Title with icon
-    icon_reader=None
+    # Title row with icon
+    header(f"LPG Pre-Check — ///{words}")
     try:
-        with open("icon.png","rb") as f: icon_reader=ImageReader(io.BytesIO(f.read()))
-    except Exception: pass
-    if icon_reader:
-        icon_w, icon_h = 22, 22
-        c.drawImage(icon_reader, M, y-icon_h+4, width=icon_w, height=icon_h, mask="auto")
-        c.setFillColor(blue); c.setFont("Helvetica-Bold", 16)
-        c.drawString(M+icon_w+8, y, f"LPG Pre-Check — ///{ctx['words']}")
-        y -= 22 + 8; c.setFillColor(colors.black)
-    else:
-        header_line(f"LPG Pre-Check — ///{ctx['words']}")
+        c.drawImage(ImageReader("icon.png"), W-M-32, H-52, width=24, height=24, mask="auto")
+    except Exception:
+        pass
 
-    addr_line=", ".join([p for p in [addr.get('road'),addr.get('city'),addr.get('postcode')] if p])
-    if addr_line: text_line(addr_line, 9, grey)
-    if addr.get("display_name"): text_line(addr["display_name"], 9, grey)
-    text_line(f"Local authority: {la_name or 'n/a'}", 9, grey)
-    if hospital: text_line(f"Nearest A&E: {hospital.get('name','n/a')} ({(hospital.get('distance_m',0)/1000):.1f} km)", 9, grey)
+    addr_line = ", ".join([p for p in [addr.get('road'), addr.get('city'), addr.get('postcode')] if p])
+    if addr_line: text_line(addr_line, grey)
+    if addr.get("display_name"): text_line(addr["display_name"], grey)
 
     # Map
-    if map_png:
+    if map_png and os.path.exists(map_png):
         try:
-            from reportlab.lib.utils import ImageReader
             from PIL import Image as PILImage
-            ir = ImageReader(io.BytesIO(map_png))
-            iw, ih = PILImage.open(io.BytesIO(map_png)).size
-            maxw, maxh = W-2*M, 210; sc = min(maxw/iw, maxh/ih)
+            iw, ih = PILImage.open(map_png).size
+            maxw, maxh = W - 2*M, 240
+            sc = min(maxw/iw, maxh/ih)
             ensure(ih*sc + 12)
-            c.drawImage(ir, M, y - ih*sc, width=iw*sc, height=ih*sc)
+            c.drawImage(ImageReader(map_png), M, y-ih*sc, width=iw*sc, height=ih*sc)
             y -= ih*sc + 12
-        except Exception: pass
+        except Exception:
+            pass
 
     # Key metrics
-    header_line("Key Metrics", 12)
-    text_line(f"Wind: { (wind.get('speed_mps') if wind.get('speed_mps') is not None else 'n/a') } m/s from {wind.get('compass') or 'n/a'}")
-    text_line(f"Slope: {slope.get('grade_pct','n/a')} %  |  Approach avg/max: {appr.get('avg_pct','n/a')} % / {appr.get('max_pct','n/a')} %")
-    text_line(f"Route indirectness: {'n/a' if rr is None else f'{rr:.2f}×'}  |  Flood: {flood['level']} — {'; '.join(flood['why'])}")
+    section("Key Metrics")
+    text_line(f"Wind: {values['wind_mps']:.1f} m/s from {values['wind_deg']}°")
+    text_line(f"Slope: {values['slope_pct']:.1f} %   |   Approach avg/max: {values['approach_avg']:.1f} / {values['approach_max']:.1f} %")
+    text_line(f"Route indirectness: {'n/a' if values['route_ratio'] is None else f'{values['route_ratio']:.2f}×'}")
 
-    # Separations
-    header_line("Separations", 12)
-    def fmt(v): return f"{v:.1f} m" if isinstance(v,(int,float)) else "n/a"
-    for lbl,key in [("Building","d_building_m"),("Shed/structure","d_outbuilding_m"),("Boundary","d_boundary_m"),
-                    ("Road/footpath","d_road_m"),("Drain/manhole","d_drain_m"),
-                    ("Overhead power lines","d_overhead_m"),("Railway","d_rail_m"),
-                    ("Watercourse","d_water_m"),("Open field/farmland","d_open_field_m")]:
-        text_line(f"{lbl}: {fmt(feats.get(key))}")
-    text_line(f"Land use: {feats.get('land_class','n/a')}")
+    section("Separations (~400 m)")
+    def fmt(v): return "n/a" if v is None else f"{v:.1f} m"
+    bullet_list([
+        f"Building: {fmt(values['building_m'])}",
+        f"Boundary: {fmt(values['boundary_m'])}",
+        f"Road/footpath: {fmt(values['road_m'])}",
+        f"Drain/manhole: {fmt(values['drain_m'])}",
+        f"Overhead power lines: {fmt(values['overhead_m'])}",
+        f"Railway: {fmt(values['rail_m'])}",
+        f"Watercourse: {fmt(values['water_m'])}",
+        f"Land use: {values['land_use']}",
+    ])
 
-    # Access & surface
-    if notes:
-        header_line("Access restrictions", 12)
-        bullet([humanize_restriction(n) for n in notes], size=10)
-    if (surf.get("risky_count",0)>0) or (surf.get("samples")):
-        header_line("Surface flags", 12)
-        bullet([f"{surf.get('risky_count',0)} flags"] + (surf.get("samples") or []), size=10)
+    section("Risk score")
+    text_line(f"Total: {rs['score']}/100 → {rs['status']}")
+    bullet_list(breakdown)
 
-    # Site answers
-    header_line("Site answers", 12)
-    sa=[]
-    if answers.get("onsite_ignitions"): sa.append("Ignition within 3 m: yes")
-    if answers.get("veg_within3m_pct",0)>0: sa.append(f"Vegetation within 3 m: {answers['veg_within3m_pct']}%")
-    if answers.get("surface_type"):     sa.append(f"Stand surface: {answers['surface_type']}")
-    fs = int(answers.get("fence_sides",0) or 0); sa.append(f"Fence/panel sides: {fs}")
-    if answers.get("los_restricted"):   sa.append("Restricted line-of-sight at stand")
-    if (answers.get("los_notes") or "").strip(): sa.append(f"LOS notes: {answers['los_notes'].strip()}")
-    if (answers.get("vegetation_notes") or "").strip(): sa.append(f"Vegetation: {answers['vegetation_notes'].strip()}")
-    bullet(sa or ["No additional site notes"], size=10)
+    section("Recommended controls")
+    bullet_list(controls)
 
-    # Vehicle & suitability
-    if vehicle:
-        header_line("Vehicle", 12)
-        text_line(f"H {vehicle.get('height_m','?')} m | W {vehicle.get('width_m','?')} m | L {vehicle.get('length_m','?')} m | GW {vehicle.get('gross_weight_t','?')} t")
-    if ctx.get("access_suitability"):
-        status = ctx["access_suitability"]["status"]
-        header_line("Access suitability (vehicle vs restrictions)", 12)
-        if status=="PASS": text_line("PASS — no blocking restrictions detected.")
-        else:
-            text_line("ATTENTION — check restrictions:"); bullet(ctx["access_suitability"].get("fails", []), size=10)
+    for head in ["Safety Risk Profile", "Environmental Considerations", "Access & Logistics", "Overall Site Suitability"]:
+        ensure(LEAD); y -= LEAD
+        section(head)
+        wrap_paragraph(ai.get(head,""))
 
-    # Risk
-    header_line("Risk score", 12)
-    text_line(f"Total: {risk['score']}/100 → {risk['status']}")
-    bullet([f"+{int(p)} {m}" for p,m in risk["explain"][:12]], size=10)
+    c.showPage(); c.save()
+    return out
+
+# -------------------------
+# Results rendering
+# -------------------------
+if submitted:
+    values = {
+        "wind_mps": wind_mps, "wind_deg": wind_deg, "slope_pct": slope_pct,
+        "approach_avg": approach_avg, "approach_max": approach_max, "route_ratio": route_ratio,
+        "building_m": building_m, "boundary_m": boundary_m, "road_m": road_m, "drain_m": drain_m,
+        "overhead_m": overhead_m, "rail_m": rail_m, "water_m": water_m, "land_use": land_use,
+    }
+
+    # Access notes/surface from OSM vs chosen vehicle
+    notes = restriction_notes(auto.get("restrictions",[]), VEHICLES[vehicle_name])
+    surf  = surface_info(auto.get("surfaces",[]))
+    access = {"notes": notes, "surface": surf}
+
+    # Score
+    rs = risk_score(values, access, veg_3m, los_issue)
+    breakdown = rs["explain"][:]
+    if values["building_m"] and values["building_m"] >= CoP["to_building_m"]:
+        breakdown.append(f"+0 Adequate building separation ({values['building_m']} m ≥ {CoP['to_building_m']} m)")
+    if values["overhead_m"] and values["overhead_m"] >= CoP["overhead_info_m"]:
+        breakdown.append(f"+0 Overhead outside attention band ({values['overhead_m']} m ≥ {CoP['overhead_info_m']} m)")
 
     # Controls
-    if controls:
-        header_line("Recommended controls", 12)
-        bullet(controls, size=10)
+    controls = make_controls(rs["status"])
 
-    # AI
-    for t in ["Safety Risk Profile","Environmental Considerations","Access & Logistics","Overall Site Suitability"]:
-        header_line(t, 12); wrap(ai.get(t,""))
+    # Layout: left (metrics) / right (AI + controls)
+    L, R = st.columns([0.48, 0.52])
+    with L:
+        st.markdown("## Key metrics")
+        km1, km2, km3 = st.columns(3)
+        km1.metric("Wind (m/s)", f"{wind_mps:.1f}")
+        km2.metric("Wind dir", f"{wind_deg}°")
+        km3.metric("Slope (%)", f"{slope_pct:.1f}")
+        k2, k3, k4 = st.columns(3)
+        k2.metric("Approach avg", f"{approach_avg:.1f}%")
+        k3.metric("Approach max", f"{approach_max:.1f}%")
+        k4.metric("Indirectness", "—" if route_ratio is None else f"{route_ratio:.2f}×")
 
-    c.showPage(); c.save(); return buff.getvalue()
-
-# ──────────────────────────────────────────────────────────────
-# Sidebar — Step 2
-# ──────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.subheader("Step 2 — Location")
-    words = st.text_input("what3words (word.word.word)", value=st.session_state.get("words",""), placeholder="filled.count.soap")
-    fetch_btn = st.button("Fetch", type="primary", use_container_width=True)
-    st.markdown("---")
-    st.subheader("Secrets")
-    st.caption(f"W3W: {'✅' if W3W_API_KEY else '❌'} • Mapbox: {'✅' if MAPBOX_TOKEN else '❌'} • OpenAI: {'✅' if OPENAI_API_KEY else '❌'}")
-
-# ──────────────────────────────────────────────────────────────
-# Fetch & initial form state
-# ──────────────────────────────────────────────────────────────
-if fetch_btn:
-    st.session_state["words"] = words
-    if words.count(".")!=2 or not all(p.isalpha() for p in words.split(".")):
-        st.error("Invalid what3words format."); st.stop()
-    with st.status("Fetching site data…"):
-        lat,lon = w3w_to_latlon(words)
-        if lat is None: st.error("what3words lookup failed."); st.stop()
-        addr     = reverse_geocode(lat,lon)
-        la_name  = addr.get("local_authority") or addr.get("county") or addr.get("state_district")
-        wind     = open_meteo(lat,lon)
-        slope    = slope_calc(lat,lon,dx=20.0)
-        osm      = overpass(lat,lon,int(CFG["cop"]["poi_radius_m"]))
-        feats    = parse_osm(lat,lon,osm)
-        hospital = get_nearest_hospital_osm(lat,lon)
-        if hospital: feats["d_hospital_m"] = round(hospital["distance_m"],1)
-        appr     = approach_grade(lat,lon,feats.get("nearest_road_line"),N=6)
-        rr       = osrm_ratio(lat,lon)
-        notes    = restriction_notes(feats.get("restrictions",[]))
-        surf     = surface_info(feats.get("surfaces",[]))
-        flood    = flood_risk(feats, slope, slope.get("elev_m"))
-        st.session_state["auto"] = dict(lat=lat, lon=lon, addr=addr, la=la_name,
-                                        wind=wind, slope=slope, feats=feats, hospital=hospital,
-                                        appr=appr, rr=rr, notes=notes, surf=surf, flood=flood)
-        st.session_state["form"] = {
-            "d_building_m": feats.get("d_building_m"), "d_outbuilding_m": feats.get("d_building_m"),
-            "d_boundary_m": feats.get("d_boundary_m"), "d_road_m": feats.get("d_road_m"),
-            "d_drain_m": feats.get("d_drain_m"), "d_overhead_m": feats.get("d_overhead_m"),
-            "d_rail_m": feats.get("d_rail_m"), "d_water_m": feats.get("d_water_m"),
-            "d_open_field_m": feats.get("d_open_field_m"),
-            "land_class": feats.get("land_class"),
-            "wind_speed_mps": wind.get("speed_mps"), "wind_deg": wind.get("deg"),
-            "slope_pct": slope.get("grade_pct"), "approach_avg": appr.get("avg_pct"),
-            "approach_max": appr.get("max_pct"), "route_ratio": rr,
-            "onsite_ignitions": False, "surface_type": "(leave unset)",
-            "veg_within3m_pct": 0, "vegetation_notes":"",
-            "fence_sides":0, "los_restricted":False, "los_notes":"",
-            "veh_height_m": CFG["vehicle_defaults"]["height_m"],
-            "veh_width_m":  CFG["vehicle_defaults"]["width_m"],
-            "veh_weight_t": CFG["vehicle_defaults"]["gross_weight_t"],
-            "veh_length_m": CFG["vehicle_defaults"]["length_m"],
-        }
-    st.success("Data fetched. Review & edit below, then press **Confirm & Assess**.")
-
-# ──────────────────────────────────────────────────────────────
-# Step 3 — Edit + Assess
-# ──────────────────────────────────────────────────────────────
-auto = st.session_state.get("auto")
-formvals = st.session_state.get("form")
-
-def distance_field(label: str, key: str, min_val=0.0, max_val=5000.0, step=0.1):
-    """
-    Always keep the number_input enabled; 'Not mapped' decides whether we persist None.
-    """
-    left, right = st.columns([0.75, 0.25])
-    default_unknown = st.session_state.get(f"{key}_unknown", formvals.get(key) is None)
-    with right:
-        unknown = st.checkbox("Not mapped", value=default_unknown, key=f"{key}_unknown")
-    with left:
-        val = st.number_input(
-            label,
-            value=float(formvals.get(key) or 0.0),
-            min_value=float(min_val), max_value=float(max_val),
-            step=float(step), format="%.1f",
-            help="If 'Not mapped' is ticked, this value is ignored."
-        )
-    st.session_state[f"{key}_unknown"] = bool(unknown)
-    formvals[key] = None if unknown else float(val)
-
-if auto and formvals:
-    st.markdown("### Step 3 — Edit values (everything is editable)")
-    with st.form("edit_all"):
-        lat,lon,addr = auto["lat"], auto["lon"], auto["addr"]
-        c1,c2,c3 = st.columns([0.45,0.35,0.20])
+        st.markdown("### Separations (~400 m)")
+        def fmt(v): return "—" if v is None else f"{v:.1f} m"
+        c1, c2 = st.columns(2)
         with c1:
-            addr_line = ", ".join([p for p in [addr.get('road'),addr.get('city'),addr.get('postcode')] if p]) or "—"
-            st.text_input("Address (OSM)", value=addr_line, disabled=True)
-            st.text_input("Display name", value=addr.get("display_name") or "—", disabled=True)
+            st.info(f"Building: {fmt(building_m)}")
+            st.info(f"Road/footpath: {fmt(road_m)}")
+            st.info(f"Overhead power lines: {fmt(overhead_m)}")
+            st.info(f"Watercourse: {fmt(water_m)}")
         with c2:
-            st.text_input("Local authority", value=(auto["la"] or "—"), disabled=True)
-            st.text_input("Nearest A&E", value=(auto["hospital"] or {}).get("name","—"), disabled=True)
-        with c3:
-            st.text_input("Latitude", value=f"{lat:.6f}", disabled=True)
-            st.text_input("Longitude", value=f"{lon:.6f}", disabled=True)
+            st.info(f"Boundary: {fmt(boundary_m)}")
+            st.info(f"Drain/manhole: {fmt(drain_m)}")
+            st.info(f"Railway: {fmt(rail_m)}")
+            st.info(f"Land use: {land_use}")
 
-        st.markdown("<hr/>", unsafe_allow_html=True)
+        st.markdown("### Access suitability (vehicle vs restrictions)")
+        if notes:
+            st.warning("ATTENTION — check the following against the selected vehicle:")
+            for n in notes: st.write(f"• {n}")
+        else:
+            st.success("PASS — no blocking restrictions detected for the selected vehicle.")
 
-        # Separations
-        st.subheader("Separations (~400 m)")
-        sL, sR = st.columns(2)
-        with sL:
-            distance_field("Building (m)", "d_building_m", max_val=2000.0)
-            distance_field("Shed / garden structure (m)", "d_outbuilding_m", max_val=2000.0)
-            distance_field("Overhead power lines (m)", "d_overhead_m", max_val=2000.0)
-            distance_field("Watercourse (m)", "d_water_m", max_val=5000.0)
-            distance_field("Open field / farmland (m)", "d_open_field_m", max_val=5000.0)  # NEW
-        with sR:
-            distance_field("Property boundary (m)", "d_boundary_m", max_val=2000.0)
-            distance_field("Drain/manhole (m)", "d_drain_m", max_val=2000.0)
-            distance_field("Railway (m)", "d_rail_m", max_val=2000.0)
-            formvals["land_class"] = st.selectbox(
-                "Land use",
-                ["Domestic/Urban","Industrial","Rural/Agricultural","Mixed"],
-                index=["Domestic/Urban","Industrial","Rural/Agricultural","Mixed"].index(formvals.get("land_class") or "Mixed")
-            )
+        st.markdown("## Risk result")
+        badge = ("🟢 PASS", "🟡 ATTENTION", "🔴 BLOCKER")[ (0 if rs['status']=="PASS" else (1 if rs['status']=="ATTENTION" else 2)) ]
+        st.metric("Score", f"{rs['score']}/100", badge)
+        st.write("**Top contributing factors**")
+        for m in rs["explain"]:
+            st.write(f"- {m}")
 
-        st.markdown("<hr/>", unsafe_allow_html=True)
+        # Map preview
+        if lat and lon:
+            try:
+                map_png = make_map_card(st.session_state.get("w3w","site"), lat, lon)
+                st.image(map_png, caption="Site map (3 m and 6 m rings)")
+            except Exception:
+                st.info("Map preview unavailable.")
 
-        # Env & approach
-        st.subheader("Environment & approach")
-        e1, e2, e3 = st.columns(3)
-        with e1:
-            formvals["wind_speed_mps"] = st.number_input("Wind speed (m/s)", value=float(formvals["wind_speed_mps"] or 0.0), min_value=0.0, max_value=60.0, step=0.1, format="%.1f")
-            formvals["slope_pct"]      = st.number_input("Local slope (%)", value=float(formvals["slope_pct"] or 0.0), min_value=0.0, max_value=100.0, step=0.1, format="%.1f")
-        with e2:
-            formvals["wind_deg"]       = st.number_input("Wind direction (°)", value=int(formvals["wind_deg"] or 0), min_value=0, max_value=359, step=1, format="%d")
-            formvals["approach_avg"]   = st.number_input("Approach avg (%)", value=float(formvals["approach_avg"] or 0.0), min_value=0.0, max_value=100.0, step=0.1, format="%.1f")
-        with e3:
-            formvals["approach_max"]   = st.number_input("Approach max (%)", value=float(formvals["approach_max"] or 0.0), min_value=0.0, max_value=100.0, step=0.1, format="%.1f")
-            auto_rr = auto.get("rr", None)
-            if auto_rr is not None:
-                st.text_input("Route indirectness (road ÷ crow-fly)", value=f"{auto_rr:.2f}", disabled=True)
-                formvals["route_ratio"] = float(auto_rr)
-            else:
-                rr_manual = st.text_input("Route indirectness (road ÷ crow-fly)", value="", placeholder="Leave blank if unknown").strip()
-                try: formvals["route_ratio"] = float(rr_manual) if rr_manual else None
-                except ValueError: formvals["route_ratio"] = None
+    with R:
+        st.markdown("## AI commentary")
+        ctx = {**values, "risk":rs}
+        ai = ai_sections(ctx)
+        with st.expander("[1] Safety Risk Profile", expanded=True):
+            st.write(ai["Safety Risk Profile"])
+        with st.expander("[2] Environmental Considerations", expanded=False):
+            st.write(ai["Environmental Considerations"])
+        with st.expander("[3] Access & Logistics", expanded=False):
+            st.write(ai["Access & Logistics"])
+        with st.expander("[4] Overall Site Suitability", expanded=False):
+            st.write(ai["Overall Site Suitability"])
 
-        st.markdown("<hr/>", unsafe_allow_html=True)
+        st.markdown("## Recommended controls")
+        for c in controls: st.write(f"• {c}")
 
-        # Vehicle
-        st.subheader("Vehicle profile (mini-bulker)")
-        v1, v2, v3, v4 = st.columns(4)
-        formvals["veh_height_m"] = v1.number_input("Height (m)", value=float(formvals["veh_height_m"]), min_value=2.0, max_value=5.0, step=0.05, format="%.2f")
-        formvals["veh_width_m"]  = v2.number_input("Width (m)",  value=float(formvals["veh_width_m"]),  min_value=2.0, max_value=3.0, step=0.05, format="%.2f")
-        formvals["veh_weight_t"] = v3.number_input("Gross weight (t)", value=float(formvals["veh_weight_t"]), min_value=3.5, max_value=44.0, step=0.5, format="%.1f")
-        formvals["veh_length_m"] = v4.number_input("Length (m)", value=float(formvals["veh_length_m"]), min_value=6.0, max_value=18.0, step=0.5, format="%.1f")
-
-        st.markdown("<hr/>", unsafe_allow_html=True)
-
-        # Site answers
-        st.subheader("Site answers")
-        a1, a2 = st.columns([0.55, 0.45])
-        with a1:
-            formvals["onsite_ignitions"] = st.toggle("Ignition source within 3 m?", value=formvals.get("onsite_ignitions", False))
-            formvals["veg_within3m_pct"] = st.slider("Vegetation within 3 m (%)", min_value=0, max_value=100, value=int(formvals.get("veg_within3m_pct", 0)))
-            formvals["vegetation_notes"] = st.text_area("Vegetation — description (optional)", value=formvals.get("vegetation_notes", ""), height=90)
-        with a2:
-            formvals["surface_type"] = st.selectbox("Surface on tanker stand", ["(leave unset)", "asphalt", "concrete", "gravel", "grass", "other"],
-                index=["(leave unset)","asphalt","concrete","gravel","grass","other"].index(formvals.get("surface_type", "(leave unset)")))
-            formvals["fence_sides"] = st.number_input("Fence/panel sides around tank (0–4)", min_value=0, max_value=4, step=1, value=int(formvals.get("fence_sides", 0)))
-            formvals["los_restricted"] = st.toggle("Restricted line-of-sight at tanker stand?", value=formvals.get("los_restricted", False))
-            formvals["los_notes"] = st.text_area("LOS details / mitigation (optional)", value=formvals.get("los_notes", ""), height=90)
-
-        confirmed = st.form_submit_button("Confirm & Assess", type="primary", use_container_width=True)
-
-    if confirmed:
-        feats = auto["feats"].copy()
-        for k in ["d_building_m","d_outbuilding_m","d_boundary_m","d_road_m","d_drain_m","d_overhead_m","d_rail_m","d_water_m","d_open_field_m","land_class"]:
-            feats[k] = formvals[k]
-        wind = {"speed_mps": formvals["wind_speed_mps"], "deg": formvals["wind_deg"],
-                "compass": ["N","NE","E","SE","S","SW","W","NW"][round((formvals["wind_deg"] or 0)%360/45)%8] if formvals["wind_deg"] is not None else None}
-        slope = {"grade_pct": formvals["slope_pct"], "aspect_deg": auto["slope"].get("aspect_deg"), "elev_m": auto["slope"].get("elev_m")}
-        appr  = {"avg_pct": formvals["approach_avg"], "max_pct": formvals["approach_max"]}
-        rr    = formvals["route_ratio"]
-        vehicle = {"height_m":formvals["veh_height_m"],"width_m":formvals["veh_width_m"],"gross_weight_t":formvals["veh_weight_t"],"length_m":formvals["veh_length_m"]}
-        answers = {
-            "onsite_ignitions": formvals["onsite_ignitions"],
-            "surface_type": formvals["surface_type"] if formvals["surface_type"]!="(leave unset)" else None,
-            "veg_within3m_pct": int(formvals.get("veg_within3m_pct", 0)),
-            "vegetation_notes": (formvals.get("vegetation_notes") or "").strip(),
-            "fence_sides": int(formvals.get("fence_sides", 0)),
-            "los_restricted": bool(formvals.get("los_restricted", False)),
-            "los_notes": (formvals.get("los_notes") or "").strip(),
-        }
-        notes = auto["notes"]; surf = auto["surf"]; flood=auto["flood"]
-        risk = risk_score(feats, wind, slope, appr, rr, notes, surf, flood, answers=answers, cfg=CFG)
-
-        def access_suitability(restriction_strings: List[str], vehicle: Dict[str, float]) -> Dict[str, Any]:
-            fails = []
-            for s in restriction_strings or []:
-                t = s.lower().strip()
-                if t.startswith("maxheight"):
-                    try:
-                        val = float(re.findall(r"([\d.]+)", t)[0])
-                        if val < vehicle["height_m"]: fails.append(f"Max height {val} m < vehicle {vehicle['height_m']} m")
-                    except: pass
-                elif t.startswith("maxwidth"):
-                    try:
-                        val = float(re.findall(r"([\d.]+)", t)[0])
-                        if val < vehicle["width_m"]: fails.append(f"Max width {val} m < vehicle {vehicle['width_m']} m")
-                    except: pass
-                elif t.startswith("maxweight"):
-                    try:
-                        val = float(re.findall(r"([\d.]+)", t)[0])
-                        if val < vehicle["gross_weight_t"]: fails.append(f"Max weight {val} t < vehicle {vehicle['gross_weight_t']} t")
-                    except: pass
-                elif t.startswith("hgv=no"):
-                    fails.append("No HGVs")
-                elif t.startswith("hgv=destination"):
-                    fails.append("HGVs — destination only")
-                elif t.startswith("access=no"):
-                    fails.append("No public access")
-                elif t.startswith("access=private"):
-                    fails.append("Private access road")
-                elif t.startswith("oneway"):
-                    fails.append("One-way")
-            status = "PASS" if not fails else "ATTENTION"
-            return {"status": status, "fails": fails}
-        suit = access_suitability(notes, vehicle)
-
-        # Build context
-        ctx = {
-            "cop": CFG["cop"], "words": st.session_state["words"], "lat": auto["lat"], "lon": auto["lon"],
-            "address": auto["addr"], "authority": auto["la"], "hospital": auto["hospital"],
-            "wind": wind, "slope": slope, "features": feats, "approach": appr,
-            "route_ratio": rr, "restrictions": notes, "surfaces": surf, "flood": flood,
-            "answers": answers, "risk": risk, "vehicle": vehicle, "access_suitability": suit
-        }
-
-        # Map for UI + PDF
-        map_bytes = None
-        if MAPBOX_TOKEN:
-            raw = fetch_map(auto["lat"], auto["lon"])
-            if raw:
-                map_bytes = overlay_rings(raw, auto["lat"])
-                st.image(map_bytes, caption="Static map (rings: 3 m / 6 m)", use_container_width=True)
-        ctx["map_png"] = map_bytes
-
-        # Controls
-        controls=[]
-        for key, rule in CFG["controls"].items():
-            if _eval_when(rule.get("when","False"), ctx):
-                controls += rule.get("actions",[])
-        controls = list(dict.fromkeys(controls))
-        ctx["controls"]=controls
-
-        # AI narrative
-        ai = ai_sections(ctx); ctx["ai"]=ai
-
-        # ──────────────── Output (two columns) ────────────────
-        colL, colR = st.columns([0.55, 0.45], gap="large")
-
-        with colL:
-            st.subheader("Key metrics")
-            r1, r2, r3 = st.columns(3)
-            with r1: keyval("Wind (m/s)", _fmt(wind.get("speed_mps")))
-            with r2: keyval("Wind dir", f"{_fmt(wind.get('deg'))}° / {wind.get('compass') or '—'}")
-            with r3: keyval("Slope (%)", _fmt(slope.get("grade_pct")))
-            r4, r5, r6 = st.columns(3)
-            with r4: keyval("Approach avg (%)", _fmt(appr.get("avg_pct")))
-            with r5: keyval("Approach max (%)", _fmt(appr.get("max_pct")))
-            with r6: keyval("Route indirectness", "—" if rr is None else f"{rr:.2f}×")
-
-            st.markdown("**Separations**")
-            sL2,sR2 = st.columns(2)
-            with sL2:
-                keyval("Building", _fmt(feats.get("d_building_m")," m"))
-                keyval("Shed / structure", _fmt(feats.get("d_outbuilding_m")," m"))
-                keyval("Overhead power lines", _fmt(feats.get("d_overhead_m")," m"))
-                keyval("Watercourse", _fmt(feats.get("d_water_m")," m"))
-                keyval("Open field / farmland", _fmt(feats.get("d_open_field_m")," m"))
-            with sR2:
-                keyval("Boundary", _fmt(feats.get("d_boundary_m")," m"))
-                keyval("Road/footpath", _fmt(feats.get("d_road_m")," m"))
-                keyval("Drain/manhole", _fmt(feats.get("d_drain_m")," m"))
-                keyval("Railway", _fmt(feats.get("d_rail_m")," m"))
-                keyval("Land use", feats.get("land_class","—"))
-
-            st.markdown("**Access restrictions**")
-            pills([humanize_restriction(n) for n in notes])
-            if surf.get("risky_count",0)>0:
-                st.markdown("**Surface flags**"); pills([f"{surf['risky_count']} flags"] + surf["samples"])
-
-            st.markdown("### Access suitability (vehicle vs restrictions)")
-            if suit["status"] == "PASS":
-                st.success("PASS — no blocking restrictions detected for the selected vehicle.")
-            else:
-                st.warning("ATTENTION — check the following against the selected vehicle:")
-                st.markdown("\n".join(f"- {m}" for m in suit["fails"]))
-
-            st.markdown("### Risk result")
-            st.metric(label="Score", value=f"{risk['score']}/100", delta=risk["status"])
-            bar_w = int(min(100, max(0, risk["score"])))
-            col = "#16a34a" if risk["status"]=="PASS" else ("#f59e0b" if risk["status"]=="ATTENTION" else "#ef4444")
-            st.markdown(f"<div class='riskbar'><div style='width:{bar_w}%;background:{col}'></div></div>", unsafe_allow_html=True)
-
-            st.markdown("**Top contributing factors**")
-            st.markdown("\n".join(f"- +{int(pts)} {msg}" for pts,msg in risk["explain"][:10]))
-
-        with colR:
-            st.subheader("AI commentary")
-            with st.expander("[1] Safety Risk Profile", expanded=True):
-                st.write(ai.get("Safety Risk Profile",""))
-            with st.expander("[2] Environmental Considerations", expanded=False):
-                st.write(ai.get("Environmental Considerations",""))
-            with st.expander("[3] Access & Logistics", expanded=False):
-                st.write(ai.get("Access & Logistics",""))
-            with st.expander("[4] Overall Site Suitability", expanded=False):
-                st.write(ai.get("Overall Site Suitability",""))
-
-            st.subheader("Recommended controls")
-            if controls: 
-                for a in controls: st.markdown(f"- {a}")
-            else:
-                st.info("No additional controls triggered.")
-
-            pdf_bytes = build_pdf_bytes(ctx)
-            if pdf_bytes:
-                st.download_button("📄 Download PDF report", data=pdf_bytes,
-                                   file_name=f"precheck_{st.session_state['words'].replace('.','_')}.pdf",
-                                   mime="application/pdf")
-            else:
-                st.caption("Install `reportlab` to enable PDF downloads.")
-
-else:
-    st.info("Enter a what3words address on the left and click **Fetch**. Then review the editable boxes and press **Confirm & Assess**.")
-
-
-
+        # PDF
+        map_png_for_pdf = None
+        try:
+            map_png_for_pdf = make_map_card(st.session_state.get("w3w","site"), lat, lon)
+        except Exception:
+            pass
+        pdf_path = build_pdf(st.session_state.get("w3w","site"), addr, lat, lon, values, rs, breakdown, controls, ai, map_png_for_pdf)
+        with open(pdf_path, "rb") as f:
+            st.download_button("📄 Download PDF report", f, file_name=os.path.basename(pdf_path), type="secondary")
