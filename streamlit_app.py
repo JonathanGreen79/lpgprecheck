@@ -8,6 +8,7 @@ from PIL import Image
 
 # ------------------------- Page config -------------------------
 PAGE_ICON = "icon.png" if os.path.exists("icon.png") else None
+COMPANY_LOGO = "companylogo.png"  # shown top-right after auth, if present
 st.set_page_config(
     page_title="LPG Customer Tank — Pre-Check",
     page_icon=PAGE_ICON,
@@ -24,17 +25,15 @@ def get_secret(name: str, default: str = "") -> str:
 W3W_API_KEY    = get_secret("W3W_API_KEY")
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")  # not used in this offline build
 MAPBOX_TOKEN   = get_secret("MAPBOX_TOKEN")
+APP_PASSWORD   = get_secret("APP_PASSWORD", "")  # <-- password lives with your API keys
 
-UA = {"User-Agent": "LPG-Precheck/1.5"}
+UA = {"User-Agent": "LPG-Precheck/1.6"}
 
 # ------------------------- Auth + status helpers -------------------------
-def effective_password() -> str:
-    # Prefer APP_PASSWORD; fallback to your previous value.
-    return get_secret("APP_PASSWORD", "Flogas2025")
-
 def is_authed() -> bool:
-    pw_expected = effective_password()
-    if not pw_expected:
+    # Require a password if provided in secrets/env
+    if not APP_PASSWORD:
+        # If no password was set at all, treat as locked open (but show sidebar warning).
         return True
     return bool(st.session_state.get("__auth_ok__", False))
 
@@ -45,20 +44,23 @@ def sidebar_secrets_status():
     st.sidebar.write(f"{tick(bool(W3W_API_KEY))} what3words API key")
     st.sidebar.write(f"{tick(bool(MAPBOX_TOKEN))} Mapbox token")
     st.sidebar.write(f"{tick(bool(OPENAI_API_KEY))} OpenAI key (optional)")
+    st.sidebar.write(f"{tick(bool(APP_PASSWORD))} App password")
 
 def sidebar_access():
     st.sidebar.markdown("#### Access")
-    pw_expected = effective_password()
-    if pw_expected:
+    if APP_PASSWORD:
+        if is_authed():
+            st.sidebar.success("🔓 Access authenticated")
+            return
         pw = st.sidebar.text_input("Password", type="password", key="__pw_input__")
         if st.sidebar.button("Unlock", key="__unlock_btn__"):
-            st.session_state["__auth_ok__"] = (pw == pw_expected)
+            st.session_state["__auth_ok__"] = (pw == APP_PASSWORD)
             if not st.session_state["__auth_ok__"]:
                 st.sidebar.error("Incorrect password")
         if not is_authed():
             st.sidebar.info("Enter the password to continue.")
     else:
-        st.sidebar.success("Open access (no password set).")
+        st.sidebar.warning("No APP_PASSWORD set — access is open.")
 
 # ------------------------- Vehicle presets -------------------------
 VEHICLE_PRESETS = {
@@ -468,14 +470,23 @@ if not is_authed():
     st.stop()
 
 # ------------------------- App -------------------------
-title_cols = st.columns([0.08, 0.92]) if PAGE_ICON else st.columns([1])
+# Title + right-aligned company logo (shown only after auth)
 if PAGE_ICON:
-    with title_cols[0]:
+    header_cols = st.columns([0.08, 0.72, 0.20])
+    with header_cols[0]:
         st.image(PAGE_ICON, use_container_width=True)
-    with title_cols[1]:
+    with header_cols[1]:
         st.title("LPG Customer Tank — Pre-Check")
+    with header_cols[2]:
+        if os.path.exists(COMPANY_LOGO) and is_authed():
+            st.image(COMPANY_LOGO, use_container_width=True)
 else:
-    st.title("LPG Customer Tank — Pre-Check")
+    header_cols = st.columns([0.80, 0.20])
+    with header_cols[0]:
+        st.title("LPG Customer Tank — Pre-Check")
+    with header_cols[1]:
+        if os.path.exists(COMPANY_LOGO) and is_authed():
+            st.image(COMPANY_LOGO, use_container_width=True)
 
 st.caption("Enter a what3words location, review/edit auto-filled data, then confirm to assess.")
 
