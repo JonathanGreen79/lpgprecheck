@@ -25,22 +25,52 @@ W3W_API_KEY    = get_secret("W3W_API_KEY")
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")  # not used in this offline build
 MAPBOX_TOKEN   = get_secret("MAPBOX_TOKEN")
 
-UA = {"User-Agent": "LPG-Precheck/1.3"}
+UA = {"User-Agent": "LPG-Precheck/1.4"}
 
 # ------------------------- Auth + status helpers -------------------------
+def effective_password() -> str:
+    # Prefer APP_PASSWORD; otherwise fall back to the original value you used.
+    return get_secret("APP_PASSWORD", "Flogas2025")
+
 def is_authed() -> bool:
-    pw_expected = get_secret("APP_PASSWORD", "")
-    if not pw_expected:
-        return True  # no password set
+    pw_expected = effective_password()
+    if not pw_expected:  # empty means open access
+        return True
     return bool(st.session_state.get("__auth_ok__", False))
 
-def secrets_status():
+def sidebar_secrets_status():
     def tick(flag: bool) -> str:
         return "✅" if flag else "⚠️"
-    st.markdown("##### Secrets status")
-    st.write(f"{tick(bool(W3W_API_KEY))} what3words API key")
-    st.write(f"{tick(bool(MAPBOX_TOKEN))} Mapbox token")
-    st.write(f"{tick(bool(OPENAI_API_KEY))} OpenAI key (optional)")
+    st.sidebar.markdown("#### Secrets status")
+    st.sidebar.write(f"{tick(bool(W3W_API_KEY))} what3words API key")
+    st.sidebar.write(f"{tick(bool(MAPBOX_TOKEN))} Mapbox token")
+    st.sidebar.write(f"{tick(bool(OPENAI_API_KEY))} OpenAI key (optional)")
+    st.sidebar.caption("Tip: set via `.streamlit/secrets.toml` or environment variables.")
+
+def sidebar_access():
+    st.sidebar.markdown("#### Access")
+    pw_expected = effective_password()
+    if pw_expected:
+        pw = st.sidebar.text_input("Password", type="password", key="__pw_input__")
+        if st.sidebar.button("Unlock", key="__unlock_btn__"):
+            st.session_state["__auth_ok__"] = (pw == pw_expected)
+            if not st.session_state["__auth_ok__"]:
+                st.sidebar.error("Incorrect password")
+        if not is_authed():
+            st.sidebar.info("Enter the password to continue.")
+    else:
+        st.sidebar.success("Open access (no password set).")
+
+# ------------------------- Vehicle presets -------------------------
+VEHICLE_PRESETS = {
+    "3.5t Van":               {"length_m": 6.0,  "width_m": 2.1, "height_m": 2.6, "turning_circle_m": 12.0},
+    "7.5t Rigid":             {"length_m": 8.0,  "width_m": 2.4, "height_m": 3.3, "turning_circle_m": 16.0},
+    "18t Rigid":              {"length_m": 10.0, "width_m": 2.5, "height_m": 3.8, "turning_circle_m": 20.0},
+    "26t Rigid":              {"length_m": 11.0, "width_m": 2.55,"height_m": 4.0, "turning_circle_m": 22.0},
+    "Artic (44t)":            {"length_m": 16.5, "width_m": 2.55,"height_m": 4.9, "turning_circle_m": 24.0},
+    "LPG Tanker (Urban)":     {"length_m": 9.2,  "width_m": 2.5, "height_m": 3.6, "turning_circle_m": 19.0},
+    "LPG Tanker (Long Rigid)":{"length_m": 11.0, "width_m": 2.5, "height_m": 3.7, "turning_circle_m": 21.0},
+}
 
 # ------------------------- Geom helpers -------------------------
 def meters_per_degree(lat_deg: float) -> Tuple[float, float]:
@@ -341,7 +371,7 @@ def ai_sections(ctx: Dict) -> Dict[str, str]:
     land = feats.get("land_class", "n/a")
 
     s1 = (
-        f"The local slope is {slope_pct:.1f}% (aspect n/a). Key separations (m): "
+        f"The local slope is {slope_pct:.1f}%. Key separations (m): "
         f"building {feats.get('building_m','n/a')}, boundary n/a, road {feats.get('road_m','n/a')}, "
         f"drain {feats.get('drain_m','n/a')}, overhead {feats.get('overhead_m','n/a')}, rail {feats.get('rail_m','n/a')}. "
         f"Wind {wind.get('speed_mps') or 0:.1f} m/s from {wind.get('compass') or 'n/a'}. "
@@ -404,6 +434,12 @@ def nm_distance(
 
     return None if nm else float(val)
 
+# ------------------------- Sidebar (status & access) -------------------------
+sidebar_secrets_status()
+sidebar_access()
+if not is_authed():
+    st.stop()
+
 # ------------------------- App -------------------------
 title_cols = st.columns([0.08, 0.92]) if PAGE_ICON else st.columns([1])
 if PAGE_ICON:
@@ -414,25 +450,9 @@ if PAGE_ICON:
 else:
     st.title("LPG Customer Tank — Pre-Check")
 
-# --- Step 1: Access + Secrets status ---
-with st.expander("Step 1 — Access & Keys", expanded=True):
-    secrets_status()
-    pw_expected = get_secret("APP_PASSWORD", "")
-    if pw_expected:
-        pw = st.text_input("Access password", type="password", key="__pw_input__")
-        if st.button("Unlock", key="__unlock_btn__"):
-            st.session_state["__auth_ok__"] = (pw == pw_expected)
-            if not st.session_state["__auth_ok__"]:
-                st.error("Incorrect password")
-    else:
-        st.info("No password set (APP_PASSWORD). Access is open.")
+st.caption("Enter a what3words location, review/edit auto-filled data, then confirm to assess.")
 
-if not is_authed():
-    st.stop()
-
-st.caption("Step 2 — Enter a what3words location, review/edit auto-filled data, then confirm to assess.")
-
-# Step 2 — Location input
+# Location input
 w3w_input = st.text_input("what3words (word.word.word):", value=st.session_state.get("w3w", ""))
 run = st.button("Run Pre-Check", type="primary")
 
@@ -512,6 +532,35 @@ if auto:
             )
 
         st.markdown("---")
+        st.subheader("Vehicle")
+        # Vehicle selector with preset dimensions (editable)
+        vcol1, vcol2, vcol3, vcol4 = st.columns(4)
+        with vcol1:
+            vehicle_type = st.selectbox("Type", list(VEHICLE_PRESETS.keys()), index=list(VEHICLE_PRESETS.keys()).index("LPG Tanker (Urban)") if "LPG Tanker (Urban)" in VEHICLE_PRESETS else 0)
+        preset = VEHICLE_PRESETS[vehicle_type]
+        # seed editable boxes (keep last edits per vehicle)
+        basekey = f"veh_{vehicle_type}"
+        if f"{basekey}_seeded" not in st.session_state:
+            for k, v in preset.items():
+                st.session_state[f"{basekey}_{k}"] = v
+            st.session_state[f"{basekey}_seeded"] = True
+        with vcol2:
+            veh_length_m = st.number_input("Length (m)", 3.0, 25.0, float(st.session_state.get(f"{basekey}_length_m", preset["length_m"])), 0.1)
+        with vcol3:
+            veh_width_m = st.number_input("Width (m)", 2.0, 3.0, float(st.session_state.get(f"{basekey}_width_m", preset["width_m"])), 0.01)
+        with vcol4:
+            veh_height_m = st.number_input("Height (m)", 2.0, 6.5, float(st.session_state.get(f"{basekey}_height_m", preset["height_m"])), 0.01)
+        tc_col = st.columns(4)[0]
+        with tc_col:
+            turning_circle_m = st.number_input("Turning circle (m)", 8.0, 30.0, float(st.session_state.get(f"{basekey}_turning_circle_m", preset["turning_circle_m"])), 0.1)
+
+        # persist edits for this vehicle selection
+        st.session_state[f"{basekey}_length_m"] = veh_length_m
+        st.session_state[f"{basekey}_width_m"] = veh_width_m
+        st.session_state[f"{basekey}_height_m"] = veh_height_m
+        st.session_state[f"{basekey}_turning_circle_m"] = turning_circle_m
+
+        st.markdown("---")
         st.subheader("Site options")
         v1, v2 = st.columns([0.5, 0.5])
         with v1:
@@ -573,6 +622,15 @@ if auto:
                 "Watercourse (m)": water_m, "Land use": land_use
             }, expanded=False)
 
+            st.markdown("#### Vehicle")
+            st.json({
+                "Type": vehicle_type,
+                "Length (m)": veh_length_m,
+                "Width (m)": veh_width_m,
+                "Height (m)": veh_height_m,
+                "Turning circle (m)": turning_circle_m,
+            }, expanded=False)
+
             st.markdown("### Risk result")
             badge = ("✅ PASS" if risk.status=="PASS"
                      else "🟡 ATTENTION" if risk.status=="ATTENTION"
@@ -612,26 +670,25 @@ if auto:
                 "Add temporary cones/signage; consider a convex mirror or visibility aids.",
                 "Plan approach/egress to avoid reversing where practicable.",
             ]
-
-            # A couple of context-aware nudges
+            # Context-aware nudges
             if stand_surface in ("gravel", "grass"):
                 controls_list.append("Ensure firm, level stand surface (temporary mats if required).")
             if overhead_m is not None and overhead_m < CoP["overhead_info_m"]:
                 controls_list.append("Confirm isolation/clearance for overhead power; position tanker outside bands.")
-
             for b in controls_list:
                 st.write("• " + b)
 
             st.markdown("---")
             st.subheader("Access suitability (vehicle vs restrictions)")
-            if stand_surface in ("asphalt", "concrete", "block paving"):
+            # Very simple heuristic using surface + turning circle
+            if stand_surface in ("asphalt", "concrete", "block paving") and turning_circle_m <= 22.0:
                 st.success("PASS — no blocking restrictions detected for the selected vehicle.")
             else:
                 st.info("ATTENTION — check turning area / bearing capacity for the selected vehicle.")
 
             # ---------- PDF export ----------
             st.markdown("### Export")
-            st.caption("Generate a one-page PDF summary (includes key metrics, separations, AI commentary, controls, and map if available).")
+            st.caption("Generate a one-page PDF summary (includes key metrics, separations, vehicle, AI commentary, controls, and map if available).")
 
             # Map image persisted if we had one
             map_path = None
@@ -711,9 +768,15 @@ if auto:
                 # Key metrics
                 header("Key Metrics", size=13)
                 text_line(f"Wind: {ctx['wind']['speed_mps']:.1f} m/s from {ctx['wind']['compass']}", col=grey)
-                text_line(f"Slope: {ctx['slope_pct']:.1f} %   |   Approach avg/max: {ctx['approach_avg']:.1f} % / {ctx['approach_max']:.1f} %", col=grey)
+                text_line(f"Slope: {ctx['slope_pct']:.1f}%   |   Approach avg/max: {ctx['approach_avg']:.1f}% / {ctx['approach_max']:.1f}%", col=grey)
                 rr_txt = ("n/a" if ctx.get("route_ratio") in (None, "", "n/a") else f"{ctx['route_ratio']:.2f}× crow-fly")
                 text_line(f"Route indirectness: {rr_txt}", col=grey)
+
+                # Vehicle
+                header("Vehicle", size=13)
+                text_line(f"Type: {ctx['vehicle']['type']}", col=grey)
+                text_line(f"Dimensions (L×W×H m): {ctx['vehicle']['length_m']:.1f} × {ctx['vehicle']['width_m']:.2f} × {ctx['vehicle']['height_m']:.2f}", col=grey)
+                text_line(f"Turning circle: {ctx['vehicle']['turning_circle_m']:.1f} m", col=grey)
 
                 # Separations
                 header("Separations (~400 m)", size=13)
@@ -738,7 +801,7 @@ if auto:
 
                 # Controls
                 header("Recommended controls", size=13)
-                for b in controls:
+                for b in ctx["controls"]:
                     wrap_paragraph("• " + b)
 
                 # AI sections
@@ -766,6 +829,14 @@ if auto:
                 "route_ratio": route_ratio,
                 "feats": feats,
                 "risk": risk,
+                "vehicle": {
+                    "type": vehicle_type,
+                    "length_m": veh_length_m,
+                    "width_m": veh_width_m,
+                    "height_m": veh_height_m,
+                    "turning_circle_m": turning_circle_m,
+                },
+                "controls": controls_list,
             }
 
             pdf_bytes = build_pdf_bytes(ctx_pdf, ai, controls_list, map_path)
