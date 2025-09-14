@@ -17,10 +17,11 @@ def auth_gate():
     if go:
         if pwd == APP_PASSWORD:
             st.session_state.auth_ok = True
-            st.experimental_rerun()
+            st.rerun()              # <- replace experimental_rerun() with rerun()
         else:
             st.error("Incorrect password.")
     st.stop()
+
 
 # ──────────────────────────────────────────────────────────────
 # Page config & styles
@@ -1145,4 +1146,5 @@ if auto and formvals:
 
 else:
     st.info("Enter a what3words address on the left and click **Fetch**. Then review the editable boxes and press **Confirm & Assess**.")
+
 
