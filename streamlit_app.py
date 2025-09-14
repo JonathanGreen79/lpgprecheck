@@ -19,20 +19,27 @@ CFG = {
     },
     "bands": {"pass_lt": 20, "attention_lt": 50},
     "weights": {
+        # separation penalties
         "building":   {"base":18,"per_m":6,"cap":40},
+        "boundary":   {"base":14,"per_m":5,"cap":32},
         "ignition":   {"base":18,"per_m":6,"cap":40},
         "drain":      {"base":18,"per_m":6,"cap":40},
         "overhead_info": 10,
         "overhead_block": 28,
         "rail_near": 10,
         "water_near": 8,
+        # environment/approach
         "low_wind": 6,
         "slope_ge6": 12,
         "slope_ge3": 8,
         "approach_steep": 12,
         "route_detour": 10,
+        # access/surface/site answers
         "surface_flag_per": 2,
         "excel_ignitions_3m": 6,
+        "fence_side": 4,            # per solid side
+        "los_restricted": 8,        # restricted line of sight
+        "vegetation": 6             # vegetation present notes
     },
     "controls": {
         "drain_within_3m": {
@@ -58,15 +65,15 @@ CFG = {
         "fence_enclosure_controls": {
             "when": "int(answers.fence_sides) >= 2",
             "actions": [
-                "Avoid enclosed pockets around the tank: keep ≥1 m ventilation gaps in panels.",
-                "If enclosure is unavoidable, add low-level gaps or louvred panels to vent heavier-than-air gas."
+                "Avoid enclosed pockets around the tank: keep ventilation gaps or louvred panels.",
+                "Ensure at least one low-level vented side to disperse heavier-than-air gas."
             ]
         },
         "vegetation_clearance": {
             "when": "bool(answers.vegetation_notes)",
             "actions": [
-                "Maintain ≥3 m vegetation clearance around the tank; remove dead brush and leaf build-up.",
-                "Keep hardstanding clear of debris to improve footing and spill control."
+                "Maintain ≥3 m vegetation clearance; remove leaf/brush build-up.",
+                "Keep hardstanding clear for footing and spill control."
             ]
         },
         "los_restricted_controls": {
@@ -81,8 +88,12 @@ CFG = {
     "vehicle_defaults": {"height_m":3.6, "width_m":2.55, "gross_weight_t":18.0, "length_m":10.0},
 }
 
-# ─────────────────────────── Styling ───────────────────────────
-st.set_page_config(page_title="LPG Customer Tank — Pre-Check", page_icon="🛢️", layout="wide")
+# ─────────────────────────── Styling / Page ────────────────────
+st.set_page_config(
+    page_title="LPG Customer Tank — Pre-Check",
+    page_icon="icon.png",  # uses icon.png in your repo root
+    layout="wide"
+)
 st.markdown("""
 <style>
 .smallcaps{font-variant:all-small-caps;letter-spacing:.04em;color:#6b7280}
@@ -113,6 +124,8 @@ def keyval(label, value):
       <div class="kv-v">{value}</div>
     </div>
     """, unsafe_allow_html=True)
+
+st.title("LPG Customer Tank — Pre-Check")
 
 # ─────────────────────────── Geo helpers ───────────────────────
 def meters_per_degree(lat_deg: float) -> Tuple[float,float]:
@@ -169,7 +182,7 @@ def reverse_geocode(lat,lon)->Dict:
     except: pass
     return {}
 
-OVERPASS="https://overpass-api.de/api/interpreter"; UA={"User-Agent":"LPG-Precheck-Streamlit/2step"}
+OVERPASS="https://overpass-api.de/api/interpreter"; UA={"User-Agent":"LPG-Precheck-Streamlit/merge"}
 def overpass(lat,lon,r)->Dict:
     q=f"""
     [out:json][timeout:60];
@@ -335,7 +348,7 @@ def get_nearest_hospital_osm(lat: float, lon: float) -> dict:
         if best: return best
     return {}
 
-# ─────────────────────────── Risk & surface ────────────────────
+# ─────────────────────────── Risk & helpers ────────────────────
 def parse_num(s):
     if not s: return None
     s=str(s).lower().strip()
@@ -394,46 +407,67 @@ def risk_score(feats, wind, slope, appr, rr, notes, surf, flood, answers=None, c
         if x is None: return None
         try: x=float(x)
         except: return None
-        return x if x>0 else None
-    def penal(dist, lim, w):
+        return x if x>0 else None  # 0.0 treated as "not mapped"
+    def penal(dist, lim, w, label=None):
         if dist is None or lim is None: return
         try: lim=float(lim)
         except: return
         if dist>=lim: return
-        if isinstance(w,(int,float)): add(w, f"Below {lim} m (≈ {dist:.1f} m)"); return
+        if isinstance(w,(int,float)):
+            add(w, f"{label or 'Below limit'} {lim} m (≈ {dist:.1f} m)"); return
         base, per_m, cap = w.get("base",0), w.get("per_m",0), w.get("cap",100)
-        pts=min(cap, base + per_m*(lim-dist)); add(pts, f"Below {lim} m (≈ {dist:.1f} m)")
-    # Effective building = min(building, shed/structure)
+        pts=min(cap, base + per_m*(lim-dist)); add(pts, f"{label or 'Below limit'} {lim} m (≈ {dist:.1f} m)")
+
+    # separations
     bld  = _safe_dist(feats.get("d_building_m"))
     shed = _safe_dist(feats.get("d_outbuilding_m"))
     eff_build = bld if shed is None else (shed if bld is None else min(bld,shed))
-    penal(eff_build, CoP.get("to_building_m"), W.get("building"))
-    penal(_safe_dist(feats.get("d_road_m")),  CoP.get("to_ignition_m"), W.get("ignition"))
-    penal(_safe_dist(feats.get("d_drain_m")), CoP.get("to_drain_m"),    W.get("drain"))
+    penal(eff_build, CoP.get("to_building_m"), W.get("building"), "Building <")
+    penal(_safe_dist(feats.get("d_boundary_m")), CoP.get("to_boundary_m"), W.get("boundary"), "Boundary <")
+    penal(_safe_dist(feats.get("d_road_m")),  CoP.get("to_ignition_m"), W.get("ignition"), "Ignition proxy <")
+    penal(_safe_dist(feats.get("d_drain_m")), CoP.get("to_drain_m"),    W.get("drain"), "Drain/manhole <")
+
     ov=_safe_dist(feats.get("d_overhead_m"))
     if ov is not None and ov < CoP["overhead_block_m"]:
         add(W.get("overhead_block",28), "Overhead power lines in no-go band")
     elif ov is not None and ov < CoP["overhead_info_m"]:
         add(W.get("overhead_info",10), "Overhead power lines in info band")
+
     rail=_safe_dist(feats.get("d_rail_m"))
     if rail is not None and rail < CoP["rail_attention_m"]:
         add(W.get("rail_near",10), f"Railway within {CoP['rail_attention_m']} m")
+
     wat=_safe_dist(feats.get("d_water_m"))
     if wat is not None and wat < 50: add(W.get("water_near",8), "Watercourse within 50 m")
+
     spd=wind.get("speed_mps")
     if spd is not None and spd<CoP["wind_stagnant_mps"]: add(W.get("low_wind",6), f"Low wind {spd:.1f} m/s")
+
     g=slope.get("grade_pct")
     if g is not None and g>=6: add(W.get("slope_ge6",12), f"Local slope {g:.1f}%")
     elif g is not None and g>=CoP["slope_attention_pct"]: add(W.get("slope_ge3",8), f"Local slope {g:.1f}%")
+
     if appr.get("max_pct") is not None and appr["max_pct"]>=CoP["approach_grade_warn_pct"]:
         add(W.get("approach_steep",12), f"Steep approach (max {appr['max_pct']}%)")
+
     if rr is not None and rr>CoP["route_vs_crowfly_ratio_warn"]:
         add(W.get("route_detour",10), f"Route ≫ crow-fly ({rr:.2f}×)")
+
     if notes: add(min(12, 4*len(notes)),"Access restrictions: "+", ".join(notes))
-    if surf.get("risky_count",0)>0: add(min(10, W.get("surface_flag_per",2)*surf['risky_count']), f"Surface flags={surf['risky_count']}")
+
+    # surface tags
+    if surf.get("risky_count",0)>0:
+        add(min(10, W.get("surface_flag_per",2)*surf['risky_count']), f"Surface flags={surf['risky_count']}")
+
+    # site answers
     if answers.get("onsite_ignitions") is True: add(W.get("excel_ignitions_3m",6), "On-site ignition within 3 m (user)")
     stype=(answers.get("surface_type") or "").lower()
     if stype in ("gravel","grass"): add(min(10, W.get("surface_flag_per",2)*2), f"Soft surface: {stype}")
+    fs = int(answers.get("fence_sides",0) or 0)
+    if fs>0: add(min(12, W.get("fence_side",4)*fs), f"Enclosure effect: {fs} solid side(s)")
+    if answers.get("los_restricted") is True: add(W.get("los_restricted",8), "Restricted line-of-sight at stand")
+    if (answers.get("vegetation_notes") or "").strip(): add(W.get("vegetation",6), "Vegetation/combustible build-up")
+
     score=round(min(100.0,max(0.0,score)),1)
     status="PASS" if score<B["pass_lt"] else ("ATTENTION" if score<B["attention_lt"] else "BLOCKER")
     why.sort(key=lambda x:-x[0])
@@ -444,41 +478,29 @@ def ai_sections(context: Dict) -> Dict[str,str]:
     def offline(ctx: Dict) -> Dict[str,str]:
         feats,wind,slope,appr,rr,flood,risk = (ctx.get(k,{}) for k in
             ["features","wind","slope","approach","route_ratio","flood","risk"])
-
         S1 = (
             f"The local slope is {slope.get('grade_pct','?')}% (aspect {int((slope.get('aspect_deg') or 0))}°). "
-            f"Key separations (m) include: building {feats.get('d_building_m')}, "
-            f"shed/structure {feats.get('d_outbuilding_m')}, boundary {feats.get('d_boundary_m')}, "
-            f"road {feats.get('d_road_m')}, drain {feats.get('d_drain_m')}, "
-            f"overhead power lines {feats.get('d_overhead_m')}, and rail {feats.get('d_rail_m')}. "
-            f"Wind is {(wind.get('speed_mps') or 0):.1f} m/s from {wind.get('compass') or 'n/a'}. "
-            f"Overall heuristic {risk.get('score','?')}/100 → {risk.get('status','?')}. The score is driven by: "
+            f"Key separations (m): building {feats.get('d_building_m')}, shed/structure {feats.get('d_outbuilding_m')}, "
+            f"boundary {feats.get('d_boundary_m')}, road {feats.get('d_road_m')}, drain {feats.get('d_drain_m')}, "
+            f"overhead power lines {feats.get('d_overhead_m')}, rail {feats.get('d_rail_m')}. "
+            f"Wind {(wind.get('speed_mps') or 0):.1f} m/s from {wind.get('compass') or 'n/a'}. "
+            f"Heuristic {risk.get('score','?')}/100 → {risk.get('status','?')}. Drivers: "
             + "; ".join([f"{int(p)} {m}" for p, m in (risk.get('explain') or [])[:4]]) + "."
         )
-
         S2 = (
-            f"Flood risk is {flood.get('level','n/a')} ({'; '.join(flood.get('why',[]))}). "
-            f"No mapped watercourse within the search radius if distance is unset. Drains and manholes should be "
-            f"protected during transfers to avoid subsurface gas migration. Land use is {feats.get('land_class','n/a')}."
+            f"Flood {flood.get('level','n/a')} ({'; '.join(flood.get('why',[]))}). "
+            f"Protect drains during transfers; land use {feats.get('land_class','n/a')}."
         )
-
         S3 = (
-            f"Approach gradients average/max {appr.get('avg_pct','?')}/{appr.get('max_pct','?')}%. "
-            + (f"Calculated route indirectness is {rr:.2f}× the crow-fly distance. " if rr else "")
-            + "Validate access restrictions and ensure the tanker stand provides sound hardstanding and clear sightlines."
+            f"Approach avg/max {appr.get('avg_pct','?')}/{appr.get('max_pct','?')}%. "
+            + (f"Route indirectness {rr:.2f}× crow-fly. " if rr else "")
+            + "Validate signage/restrictions; provide sound hardstanding and clear sightlines."
         )
-
-        S4 = (
-            "Site appears suitable with routine controls." if risk.get('status') == 'PASS'
-            else "Attention required: confirm minimum separations to CoP1, control ignition sources, "
-                 "protect drainage, and plan safe approach/egress under adverse conditions."
-        )
-
+        S4 = ("Site appears suitable with routine controls." if risk.get('status')=='PASS'
+              else "Attention required: confirm separations, control ignition, protect drainage, plan safe approach/egress.")
         return {
-            "Safety Risk Profile": S1,
-            "Environmental Considerations": S2,
-            "Access & Logistics": S3,
-            "Overall Site Suitability": S4,
+            "Safety Risk Profile": S1, "Environmental Considerations": S2,
+            "Access & Logistics": S3, "Overall Site Suitability": S4,
         }
 
     if not OPENAI_API_KEY:
@@ -492,13 +514,11 @@ Use four sections exactly:
 [2] Environmental Considerations
 [3] Access & Logistics
 [4] Overall Site Suitability
-For each section, write 2–4 sentences (plain language, numeric where relevant). Include implications and
-practical actions. Avoid repeating the headings inside the paragraphs.
+2–4 sentences per section, plain language, numeric where relevant; include practical actions.
 
 Context JSON:
 {json.dumps(context, ensure_ascii=False)}
 """.strip()
-
         r = requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type":"application/json"},
@@ -509,7 +529,6 @@ Context JSON:
         )
         if r.status_code != 200:
             return offline(context)
-
         text = r.json()["choices"][0]["message"]["content"].strip()
         sections = {"Safety Risk Profile":"","Environmental Considerations":"","Access & Logistics":"","Overall Site Suitability":""}
         current=None; mapping={"[1]":"Safety Risk Profile","[2]":"Environmental Considerations","[3]":"Access & Logistics","[4]":"Overall Site Suitability"}
@@ -521,18 +540,13 @@ Context JSON:
                     if t: sections[current]+=t+"\n"; break
             else:
                 if current: sections[current]+=t+"\n"
-
         # tidy + fallback
-        clean={}
-        for heading, body in sections.items():
-            lines=[ln.rstrip() for ln in (body or "").splitlines()]
+        clean={}; fb=offline(context)
+        for k,v in sections.items():
+            lines=[ln.rstrip() for ln in (v or "").splitlines()]
             while lines and not lines[0].strip(): lines.pop(0)
-            clean[heading]="\n".join(lines).strip()
-        fb=offline(context)
-        for k in clean:
-            if not clean[k]: clean[k]=fb[k]
+            clean[k]="\n".join(lines).strip() or fb[k]
         return clean
-
     except Exception:
         return offline(context)
 
@@ -648,7 +662,6 @@ def build_pdf_bytes(ctx: dict) -> bytes:
     c.showPage(); c.save(); return buff.getvalue()
 
 # ─────────────────────────── Sidebar ───────────────────────────
-st.title("🛢️ LPG Customer Tank — Pre-Check")
 with st.sidebar:
     st.subheader("Step 1 — Location")
     words = st.text_input("what3words (word.word.word)", value=st.session_state.get("words",""), placeholder="filled.count.soap")
@@ -681,7 +694,6 @@ if fetch_btn:
         st.session_state["auto"] = dict(lat=lat, lon=lon, addr=addr, la=la_name,
                                         wind=wind, slope=slope, feats=feats, hospital=hospital,
                                         appr=appr, rr=rr, notes=notes, surf=surf, flood=flood)
-        # Form defaults
         st.session_state["form"] = {
             "d_building_m": feats.get("d_building_m"), "d_outbuilding_m": feats.get("d_building_m"),
             "d_boundary_m": feats.get("d_boundary_m"), "d_road_m": feats.get("d_road_m"),
@@ -705,7 +717,6 @@ auto = st.session_state.get("auto")
 formvals = st.session_state.get("form")
 
 def distance_field(label: str, key: str, min_val=0.0, max_val=5000.0, step=0.1):
-    """Number input + 'Not mapped' checkbox. Stores None when unknown."""
     c1, c2 = st.columns([0.75, 0.25])
     unknown_default = (formvals.get(key) is None)
     with c2:
@@ -773,20 +784,10 @@ if auto and formvals:
             formvals["approach_max"]   = st.number_input("Approach max (%)", value=float(formvals["approach_max"] or 0.0), min_value=0.0, max_value=100.0, step=0.1, format="%.1f")
             auto_rr = auto.get("rr", None)
             if auto_rr is not None:
-                st.text_input(
-                    "Route indirectness (road ÷ crow-fly)",
-                    value=f"{auto_rr:.2f}",
-                    disabled=True,
-                    help="1.0 = direct; higher means detours/indirect access. Computed automatically."
-                )
+                st.text_input("Route indirectness (road ÷ crow-fly)", value=f"{auto_rr:.2f}", disabled=True, help="1.0 = direct; higher = detours/indirect access.")
                 formvals["route_ratio"] = float(auto_rr)
             else:
-                rr_manual = st.text_input(
-                    "Route indirectness (road ÷ crow-fly)",
-                    value="",
-                    placeholder="Leave blank if unknown",
-                    help="Optional: divide known road distance by straight-line distance. Example: 18 km / 10 km → 1.8"
-                ).strip()
+                rr_manual = st.text_input("Route indirectness (road ÷ crow-fly)", value="", placeholder="Leave blank if unknown").strip()
                 try: formvals["route_ratio"] = float(rr_manual) if rr_manual else None
                 except ValueError: formvals["route_ratio"] = None
 
@@ -806,41 +807,14 @@ if auto and formvals:
         st.subheader("Site answers")
         a1, a2 = st.columns([0.55, 0.45])
         with a1:
-            formvals["onsite_ignitions"] = st.toggle(
-                "Ignition source within 3 m?",
-                value=formvals.get("onsite_ignitions", False),
-                help="E.g., sockets, AC units, fixed ignition near the tank."
-            )
-            formvals["vegetation_notes"] = st.text_area(
-                "Vegetation around tank (optional)",
-                value=formvals.get("vegetation_notes", ""),
-                placeholder="e.g. hedge inside 3 m; dead leaves; overhanging branches.",
-                height=90
-            )
+            formvals["onsite_ignitions"] = st.toggle("Ignition source within 3 m?", value=formvals.get("onsite_ignitions", False))
+            formvals["vegetation_notes"] = st.text_area("Vegetation around tank (optional)", value=formvals.get("vegetation_notes", ""), placeholder="e.g. hedge inside 3 m; dead leaves; overhanging branches.", height=90)
         with a2:
-            formvals["surface_type"] = st.selectbox(
-                "Surface on tanker stand",
-                ["(leave unset)", "asphalt", "concrete", "gravel", "grass", "other"],
-                index=["(leave unset)","asphalt","concrete","gravel","grass","other"]
-                      .index(formvals.get("surface_type", "(leave unset)"))
-            )
-            formvals["fence_sides"] = st.number_input(
-                "Fence/panel sides around tank (0–4)",
-                min_value=0, max_value=4, step=1,
-                value=int(formvals.get("fence_sides", 0)),
-                help="Count solid sides (panels/walls/hedges acting as barriers)."
-            )
-            formvals["los_restricted"] = st.toggle(
-                "Restricted line-of-sight at tanker stand?",
-                value=formvals.get("los_restricted", False),
-                help="Bends, walls, parked cars, blind entrances, etc."
-            )
-            formvals["los_notes"] = st.text_area(
-                "LOS details / mitigation (optional)",
-                value=formvals.get("los_notes", ""),
-                placeholder="e.g. narrow lane with blind bend; recommend banksman.",
-                height=90
-            )
+            formvals["surface_type"] = st.selectbox("Surface on tanker stand", ["(leave unset)", "asphalt", "concrete", "gravel", "grass", "other"],
+                index=["(leave unset)","asphalt","concrete","gravel","grass","other"].index(formvals.get("surface_type", "(leave unset)")))
+            formvals["fence_sides"] = st.number_input("Fence/panel sides around tank (0–4)", min_value=0, max_value=4, step=1, value=int(formvals.get("fence_sides", 0)))
+            formvals["los_restricted"] = st.toggle("Restricted line-of-sight at tanker stand?", value=formvals.get("los_restricted", False))
+            formvals["los_notes"] = st.text_area("LOS details / mitigation (optional)", value=formvals.get("los_notes", ""), placeholder="e.g. narrow lane with blind bend; recommend banksman.", height=90)
 
         confirmed = st.form_submit_button("Confirm & Assess", type="primary", use_container_width=True)
 
@@ -866,7 +840,7 @@ if auto and formvals:
         notes = auto["notes"]; surf = auto["surf"]; flood=auto["flood"]
         risk = risk_score(feats, wind, slope, appr, rr, notes, surf, flood, answers=answers, cfg=CFG)
 
-        # Access suitability vs vehicle
+        # Access suitability (separate from risk)
         def access_suitability(restriction_strings: List[str], vehicle: Dict[str, float]) -> Dict[str, Any]:
             fails = []
             for s in restriction_strings or []:
@@ -914,7 +888,7 @@ if auto and formvals:
         controls = list(dict.fromkeys(controls))
         ctx["controls"]=controls
 
-        # AI (expanded narrative)
+        # AI narrative
         ai = ai_sections(ctx); ctx["ai"]=ai
 
         # ──────────────── Output (two columns) ────────────────
@@ -959,7 +933,7 @@ if auto and formvals:
             st.markdown("### Risk result")
             st.metric(label="Score", value=f"{risk['score']}/100", delta=risk["status"])
             st.markdown("**Top contributing factors**")
-            st.markdown("\n".join(f"- +{int(pts)} {msg}" for pts,msg in risk["explain"][:8]))
+            st.markdown("\n".join(f"- +{int(pts)} {msg}" for pts,msg in risk["explain"][:10]))
 
             if MAPBOX_TOKEN:
                 img = fetch_map(auto["lat"], auto["lon"])
@@ -994,6 +968,3 @@ if auto and formvals:
 
 else:
     st.info("Enter a what3words address on the left and click **Fetch**. Then review the editable boxes and press **Confirm & Assess**.")
-
-
-
