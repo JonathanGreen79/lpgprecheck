@@ -552,6 +552,7 @@ with c_reset:
     reset = st.button("Reset", type="secondary", use_container_width=True)
 
 
+
 # Buttons after input
 c_run, c_reset, _ = st.columns([0.18, 0.14, 0.68])
 with c_run:
@@ -1015,4 +1016,5 @@ if auto:
                 )
             else:
                 st.caption("PDF generation unavailable on this host (ReportLab not installed).")
+
 
