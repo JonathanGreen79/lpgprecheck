@@ -31,7 +31,9 @@ UA = {"User-Agent": "LPG-Precheck/1.7"}
 
 # ------------------------- Auth + status helpers -------------------------
 def is_authed() -> bool:
+    # Require a password if provided in secrets/env
     if not APP_PASSWORD:
+        # If no password was set at all, treat as locked open (but show sidebar warning).
         return True
     return bool(st.session_state.get("__auth_ok__", False))
 
@@ -50,15 +52,17 @@ def sidebar_access():
         st.sidebar.warning("No APP_PASSWORD set — access is open.")
         return
 
-    # Already authed? show status and exit
+    # If already authenticated, show message and stop rendering the input
     if st.session_state.get("__auth_ok__", False):
         st.sidebar.success("🔓 Access authenticated")
         return
 
+    # Otherwise, show the password input + unlock button
     def _try_unlock():
         ok = (st.session_state.get("__pw_input__", "") == APP_PASSWORD)
         st.session_state["__auth_ok__"] = ok
         if ok:
+            # clear the typed password and re-run so the input disappears immediately
             st.session_state["__pw_input__"] = ""
             st.rerun()
 
@@ -66,11 +70,12 @@ def sidebar_access():
         "Password",
         type="password",
         key="__pw_input__",
-        on_change=_try_unlock,
+        on_change=_try_unlock,  # pressing Enter unlocks too
     )
     if st.sidebar.button("Unlock", key="__unlock_btn__"):
         _try_unlock()
 
+    # If still not authed after attempts, nudge the user
     if not st.session_state.get("__auth_ok__", False):
         st.sidebar.info("Enter the password to continue.")
 
@@ -209,7 +214,7 @@ out tags geom;
     except Exception:
         return {"elements": []}
 
-# ---- NEW: nearest hospital with escalating radius
+# ---- Nearest hospital with escalating radius
 def nearest_hospital(lat: float, lon: float) -> Dict:
     """Return nearest hospital-like feature up to 10 km."""
     radii = [400, 1000, 3000, 10000]
@@ -245,7 +250,7 @@ out tags geom 20;
                 la, lo = el.get("lat"), el.get("lon")
             else:
                 geom = el.get("geometry") or []
-                if not geom: 
+                if not geom:
                     continue
                 la, lo = centroid([(g["lat"], g["lon"]) for g in geom])
             d = _dist_m(lat, lon, la, lo)
@@ -462,12 +467,25 @@ def ai_sections(ctx: Dict) -> Dict[str, str]:
     }
 
 # ------------------------- UI helper: seeded, editable distance -------------------------
-def nm_distance(label: str, key: str, auto_val: Optional[float], max_val: float = 2000.0, seed_tag: Optional[str] = None) -> Optional[float]:
+def nm_distance(
+    label: str,
+    key: str,
+    auto_val: Optional[float],
+    max_val: float = 2000.0,
+    seed_tag: Optional[str] = None,
+) -> Optional[float]:
+    """
+    - Always editable number input (works inside st.form)
+    - Auto-seeds from current W3W (seed_tag) so boxes show fetched values
+    - Returns None when 'Not mapped' is ticked
+    """
     tag = seed_tag or "__default__"
+
     if st.session_state.get(f"{key}__seed") != tag:
         st.session_state[f"{key}__nm"]  = (auto_val is None)
         st.session_state[f"{key}__val"] = 0.0 if auto_val is None else float(auto_val)
         st.session_state[f"{key}__seed"] = tag
+
     c1, c2 = st.columns([0.78, 0.22])
     with c1:
         val = st.number_input(
@@ -478,8 +496,10 @@ def nm_distance(label: str, key: str, auto_val: Optional[float], max_val: float 
         )
     with c2:
         nm = st.checkbox("Not mapped", value=st.session_state[f"{key}__nm"], key=f"{key}__nm_chk")
+
     st.session_state[f"{key}__val"] = val
     st.session_state[f"{key}__nm"]  = nm
+
     return None if nm else float(val)
 
 # ------------------------- Pretty key/value block -------------------------
@@ -489,6 +509,7 @@ def kv_block(title: str, data: Dict, cols: int = 2, fmt: Dict[str, str] | None =
     keys = list(data.keys())
     rows = (len(keys) + cols - 1) // cols
     fmt = fmt or {}
+    # normalize values
     def show(k, v):
         if v is None:
             return "—"
@@ -533,25 +554,25 @@ else:
     with header_cols[0]:
         st.title("LPG Customer Tank — Pre-Check")
     with header_cols[1]:
-        if os.path.exists(COMPANY_LOGO) and is_authed():
+        if os.path_exists(COMPANY_LOGO) and is_authed():
             st.image(COMPANY_LOGO, use_container_width=True)
 
 st.caption("Enter a what3words location, review/edit auto-filled data, then confirm to assess.")
 
-# Location input
+# ------------------------- W3W input THEN buttons -------------------------
 w3w_input = st.text_input(
     "what3words (word.word.word):",
-    value=st.session_state.get("w3w", "")
+    value=st.session_state.get("w3w", ""),
+    key="w3w_entry",
 )
 
-# Buttons after input
 c_run, c_reset, _ = st.columns([0.18, 0.14, 0.68])
 with c_run:
-    run = st.button("Run Pre-Check", type="primary", use_container_width=True)
+    run = st.button("Run Pre-Check", type="primary", use_container_width=True, key="run_btn")
 with c_reset:
-    reset = st.button("Reset", type="secondary", use_container_width=True)
+    reset = st.button("Reset", type="secondary", use_container_width=True, key="reset_btn")
 
-
+# Reset: clear data below and W3W, hide edit/results until new W3W entered
 if reset:
     for k in list(st.session_state.keys()):
         if k.startswith("d_") or k.endswith("__val") or k.endswith("__nm") or k.endswith("__seed") or k.startswith("veh_"):
@@ -560,36 +581,40 @@ if reset:
     st.session_state.pop("w3w", None)
     st.rerun()
 
-w3w_input = st.text_input("what3words (word.word.word):", value=st.session_state.get("w3w", ""))
+# ------------------------- Run handler -------------------------
+if run:
+    w3w_clean = (w3w_input or "").strip()
+    if not w3w_clean or w3w_clean.count(".") != 2:
+        st.error("Please enter a valid what3words (word.word.word).")
+    else:
+        # Clear previous auto so sections hide while spinner shows
+        st.session_state.pop("auto", None)
+        st.session_state["w3w"] = w3w_clean
+        with st.status("Fetching site data…", expanded=False):
+            lat, lon = w3w_to_latlon(w3w_clean)
+            if lat is None:
+                st.error("what3words lookup failed.")
+                st.stop()
 
-if run and w3w_input and w3w_input.count(".") == 2:
-    st.session_state.pop("auto", None)
-    st.session_state["w3w"] = w3w_input.strip()
-    with st.status("Fetching site data…", expanded=False):
-        lat, lon = w3w_to_latlon(st.session_state["w3w"])
-        if lat is None:
-            st.error("what3words lookup failed.")
-            st.stop()
+            addr = reverse_geocode(lat, lon)
+            wind = open_meteo(lat, lon)
+            osm  = overpass_near(lat, lon, radius=400)
+            feats = parse_osm(lat, lon, osm)
+            hosp = nearest_hospital(lat, lon)
 
-        addr = reverse_geocode(lat, lon)
-        wind = open_meteo(lat, lon)
-        osm  = overpass_near(lat, lon, radius=400)
-        feats = parse_osm(lat, lon, osm)
-        hosp = nearest_hospital(lat, lon)
-
-        st.session_state["auto"] = {
-            "lat": lat, "lon": lon,
-            "addr": addr,
-            "hospital": hosp,
-            "wind_mps": wind.get("speed_mps") or 0.0,
-            "wind_deg": wind.get("deg") or 0,
-            "wind_comp": wind.get("compass") or "n/a",
-            "slope_pct": 3.5,
-            "approach_avg": 0.9,
-            "approach_max": 3.5,
-            **feats,
-        }
-        st.success("Auto data ready.")
+            st.session_state["auto"] = {
+                "lat": lat, "lon": lon,
+                "addr": addr,
+                "hospital": hosp,
+                "wind_mps": wind.get("speed_mps") or 0.0,
+                "wind_deg": wind.get("deg") or 0,
+                "wind_comp": wind.get("compass") or "n/a",
+                "slope_pct": 3.5,      # optional: add elevation service later
+                "approach_avg": 0.9,
+                "approach_max": 3.5,
+                **feats,
+            }
+            st.success("Auto data ready.")
 
 # --- Use persisted auto for the form and results ---
 auto = st.session_state.get("auto", {})
@@ -603,37 +628,37 @@ if auto:
         st.subheader("Location & address")
         a1, a2 = st.columns([0.6, 0.4])
         with a1:
-            addr_road = st.text_input("Road / street", auto.get("addr", {}).get("road", ""))
-            addr_city = st.text_input("Town / City", auto.get("addr", {}).get("city", ""))
-            addr_postcode = st.text_input("Postcode", auto.get("addr", {}).get("postcode", ""))
-            addr_local = st.text_input("Local authority", auto.get("addr", {}).get("local_authority", ""))
-            hosp_name = st.text_input("Nearest hospital", (auto.get("hospital", {}) or {}).get("name", ""))
+            addr_road     = st.text_input("Road / street", auto.get("addr", {}).get("road", ""), key="addr_road")
+            addr_city     = st.text_input("Town / City",   auto.get("addr", {}).get("city", ""), key="addr_city")
+            addr_postcode = st.text_input("Postcode",      auto.get("addr", {}).get("postcode", ""), key="addr_postcode")
+            addr_local    = st.text_input("Local authority", auto.get("addr", {}).get("local_authority", ""), key="addr_local")
+            hosp_name     = st.text_input("Nearest hospital", (auto.get("hospital", {}) or {}).get("name", ""), key="hosp_name")
         with a2:
-            st.text_input("what3words", st.session_state.get("w3w", ""), disabled=True)
-            st.text_input("Latitude", f"{auto.get('lat', '')}", disabled=True)
-            st.text_input("Longitude", f"{auto.get('lon', '')}", disabled=True)
+            st.text_input("what3words", st.session_state.get("w3w", ""), disabled=True, key="w3w_display")
+            st.text_input("Latitude", f"{auto.get('lat', '')}", disabled=True, key="lat_display")
+            st.text_input("Longitude", f"{auto.get('lon', '')}", disabled=True, key="lon_display")
             hosp_dist = (auto.get("hospital", {}) or {}).get("distance_m", None)
             hosp_km = f"{(hosp_dist/1000):.2f} km" if isinstance(hosp_dist, (int, float)) else "—"
-            st.text_input("Hospital distance (approx.)", hosp_km, disabled=True)
+            st.text_input("Hospital distance (approx.)", hosp_km, disabled=True, key="hosp_dist_ro")
         st.markdown("---")
 
         # ---------------- Environment & approach ----------------
         st.subheader("Environment & approach")
         e1, e2, e3 = st.columns(3)
         with e1:
-            wind_mps = st.number_input("Wind (m/s)", 0.0, 60.0, float(auto.get("wind_mps", 0.0)), 0.1)
+            wind_mps = st.number_input("Wind (m/s)", 0.0, 60.0, float(auto.get("wind_mps", 0.0)), 0.1, key="wind_mps_in")
         with e2:
-            wind_deg = st.number_input("Wind dir (°)", 0, 359, int(auto.get("wind_deg", 0)), 1)
+            wind_deg = st.number_input("Wind dir (°)", 0, 359, int(auto.get("wind_deg", 0)), 1, key="wind_deg_in")
         with e3:
-            slope_pct = st.number_input("Slope (%)", 0.0, 100.0, float(auto.get("slope_pct", 0.0)), 0.1)
+            slope_pct = st.number_input("Slope (%)", 0.0, 100.0, float(auto.get("slope_pct", 0.0)), 0.1, key="slope_pct_in")
 
-        a1, a2, a3 = st.columns(3)
-        with a1:
-            approach_avg = st.number_input("Approach avg (%)", 0.0, 100.0, float(auto.get("approach_avg", 0.0)), 0.1)
-        with a2:
-            approach_max = st.number_input("Approach max (%)", 0.0, 100.0, float(auto.get("approach_max", 0.0)), 0.1)
-        with a3:
-            rr_str = st.text_input("Route indirectness (× crow-fly) — optional", value="", placeholder="leave blank")
+        a1c, a2c, a3c = st.columns(3)
+        with a1c:
+            approach_avg = st.number_input("Approach avg (%)", 0.0, 100.0, float(auto.get("approach_avg", 0.0)), 0.1, key="approach_avg_in")
+        with a2c:
+            approach_max = st.number_input("Approach max (%)", 0.0, 100.0, float(auto.get("approach_max", 0.0)), 0.1, key="approach_max_in")
+        with a3c:
+            rr_str = st.text_input("Route indirectness (× crow-fly) — optional", value="", placeholder="leave blank", key="route_ratio_input")
             try:
                 route_ratio = float(rr_str) if rr_str.strip() else None
             except:
@@ -657,6 +682,7 @@ if auto:
                 index=["Domestic/Urban", "Industrial", "Mixed", "Rural/Agricultural"].index(
                     auto.get("land_class", "Domestic/Urban")
                 ),
+                key="land_use_sel"
             )
 
         st.markdown("---")
@@ -666,7 +692,8 @@ if auto:
             vehicle_type = st.selectbox(
                 "Type",
                 list(VEHICLE_PRESETS.keys()),
-                index=list(VEHICLE_PRESETS.keys()).index("LPG Tanker (Urban)") if "LPG Tanker (Urban)" in VEHICLE_PRESETS else 0
+                index=list(VEHICLE_PRESETS.keys()).index("LPG Tanker (Urban)") if "LPG Tanker (Urban)" in VEHICLE_PRESETS else 0,
+                key="vehicle_type_sel"
             )
         preset = VEHICLE_PRESETS[vehicle_type]
         basekey = f"veh_{vehicle_type}"
@@ -675,16 +702,17 @@ if auto:
                 st.session_state[f"{basekey}_{k}"] = v
             st.session_state[f"{basekey}_seeded"] = True
         with vcol2:
-            veh_length_m = st.number_input("Length (m)", 3.0, 25.0, float(st.session_state.get(f"{basekey}_length_m", preset["length_m"])), 0.1)
+            veh_length_m = st.number_input("Length (m)", 3.0, 25.0, float(st.session_state.get(f"{basekey}_length_m", preset["length_m"])), 0.1, key="veh_len_in")
         with vcol3:
-            veh_width_m = st.number_input("Width (m)", 2.0, 3.0, float(st.session_state.get(f"{basekey}_width_m", preset["width_m"])), 0.01)
+            veh_width_m = st.number_input("Width (m)", 2.0, 3.0, float(st.session_state.get(f"{basekey}_width_m", preset["width_m"])), 0.01, key="veh_w_in")
         with vcol4:
-            veh_height_m = st.number_input("Height (m)", 2.0, 6.5, float(st.session_state.get(f"{basekey}_height_m", preset["height_m"])), 0.01)
+            veh_height_m = st.number_input("Height (m)", 2.0, 6.5, float(st.session_state.get(f"{basekey}_height_m", preset["height_m"])), 0.01, key="veh_h_in")
         tc_col = st.columns(4)[0]
         with tc_col:
-            turning_circle_m = st.number_input("Turning circle (m)", 8.0, 30.0, float(st.session_state.get(f"{basekey}_turning_circle_m", preset["turning_circle_m"])), 0.1)
+            turning_circle_m = st.number_input("Turning circle (m)", 8.0, 30.0, float(st.session_state.get(f"{basekey}_turning_circle_m", preset["turning_circle_m"])), 0.1, key="veh_tc_in")
+        # persist per vehicle
         st.session_state[f"{basekey}_length_m"] = veh_length_m
-        st.session_state[f"{basekey}_width_m"] = veh_width_m
+        st.session_state[f"{basekey}_width_m"]  = veh_width_m
         st.session_state[f"{basekey}_height_m"] = veh_height_m
         st.session_state[f"{basekey}_turning_circle_m"] = turning_circle_m
 
@@ -692,28 +720,30 @@ if auto:
         st.subheader("Site options")
         v1, v2 = st.columns([0.5, 0.5])
         with v1:
-            veg_3m = st.slider("Vegetation within 3 m of tank (0 none → 3 heavy)", 0, 3, 1)
+            veg_3m = st.slider("Vegetation within 3 m of tank (0 none → 3 heavy)", 0, 3, 1, key="veg_slider")
             enclosure_sides = st.select_slider(
                 "Number of solid sides enclosing tank/stand (fence/walls)",
-                options=[0, 1, 2, 3, 4], value=0
+                options=[0, 1, 2, 3, 4], value=0, key="enclosure_sides_sel"
             )
             los_slider = st.select_slider(
                 "Restricted line-of-sight at stand",
                 options=["No", "Yes"],
-                value="No"
+                value="No",
+                key="los_sel"
             )
             los_issue = (los_slider == "Yes")
         with v2:
             stand_surface = st.selectbox(
                 "Stand surface",
                 ["asphalt", "concrete", "block paving", "gravel", "grass", "other"],
-                index=0
+                index=0,
+                key="stand_surface_sel"
             )
             open_field_m = nm_distance("Distance to open field (m)", "d_open_field_m", None, seed_tag=seed)
 
-        notes_txt = st.text_input("Notes (vegetation / sightlines / special instructions)", value="")
+        notes_txt = st.text_input("Notes (vegetation / sightlines / special instructions)", value="", key="notes_input")
 
-        submitted = st.form_submit_button("Confirm & assess", type="primary")
+        submitted = st.form_submit_button("Confirm & assess", type="primary", key="confirm_btn")
 
     if submitted:
         feats = {
@@ -1007,4 +1037,3 @@ if auto:
                 )
             else:
                 st.caption("PDF generation unavailable on this host (ReportLab not installed).")
-
