@@ -179,7 +179,6 @@ def parse_osm(lat0, lon0, data) -> Dict:
         elif t in ("way","relation") and tags.get("landuse"):
             land_polys.append({"tag": tags.get("landuse"), "coords": coords})
 
-    # helper to min ignoring None
     def _min_clean(vals):
         vals = [v for v in vals if v is not None]
         return min(vals) if vals else None
@@ -574,7 +573,7 @@ if auto:
                 with st.expander(f"[{i}] {k}", expanded=(i == 1)):
                     st.write(ai[k])
 
-                        st.markdown("### Recommended controls")
+            st.markdown("### Recommended controls")
             controls_list = [
                 "Use a trained banksman during manoeuvres and reversing.",
                 "Add temporary cones/signage; consider a convex mirror or visibility aids.",
