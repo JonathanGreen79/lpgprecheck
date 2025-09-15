@@ -23,17 +23,16 @@ def get_secret(name: str, default: str = "") -> str:
         return os.getenv(name, default)
 
 W3W_API_KEY    = get_secret("W3W_API_KEY")
-OPENAI_API_KEY = get_secret("OPENAI_API_KEY")  # not used in this offline build
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")  # used for online AI
 MAPBOX_TOKEN   = get_secret("MAPBOX_TOKEN")
 APP_PASSWORD   = get_secret("APP_PASSWORD", "")  # <-- password lives with your API keys
+AI_MODEL       = get_secret("AI_MODEL", "gpt-4o-mini")  # optional override
 
-UA = {"User-Agent": "LPG-Precheck/1.7"}
+UA = {"User-Agent": "LPG-Precheck/1.8"}
 
 # ------------------------- Auth + status helpers -------------------------
 def is_authed() -> bool:
-    # Require a password if provided in secrets/env
     if not APP_PASSWORD:
-        # If no password was set at all, treat as locked open (but show sidebar warning).
         return True
     return bool(st.session_state.get("__auth_ok__", False))
 
@@ -45,6 +44,8 @@ def sidebar_secrets_status():
     st.sidebar.write(f"{tick(bool(MAPBOX_TOKEN))} Mapbox Token")
     st.sidebar.write(f"{tick(bool(OPENAI_API_KEY))} OpenAI key")
     st.sidebar.write(f"{tick(bool(APP_PASSWORD))} App Authenticator")
+    mode = "Online" if OPENAI_API_KEY else "Offline (fallback)"
+    st.sidebar.caption(f"AI commentary mode: **{mode}**")
 
 def sidebar_access():
     st.sidebar.markdown("#### Access")
@@ -52,29 +53,25 @@ def sidebar_access():
         st.sidebar.warning("No APP_PASSWORD set — access is open.")
         return
 
-    # If already authenticated, show message and stop rendering the input
     if st.session_state.get("__auth_ok__", False):
         st.sidebar.success("🔓 Access authenticated")
         return
 
-    # Otherwise, show the password input + unlock button
     def _try_unlock():
         ok = (st.session_state.get("__pw_input__", "") == APP_PASSWORD)
         st.session_state["__auth_ok__"] = ok
         if ok:
             st.session_state["__pw_input__"] = ""
-    
 
     st.sidebar.text_input(
         "Password",
         type="password",
         key="__pw_input__",
-        on_change=_try_unlock,  # pressing Enter unlocks too
+        on_change=_try_unlock,
     )
     if st.sidebar.button("Unlock", key="__unlock_btn__"):
         _try_unlock()
 
-    # If still not authed after attempts, nudge the user
     if not st.session_state.get("__auth_ok__", False):
         st.sidebar.info("Enter the password to continue.")
 
@@ -132,7 +129,7 @@ def w3w_to_latlon(words: str) -> Tuple[Optional[float], Optional[float]]:
     try:
         r = requests.get(
             "https://api.what3words.com/v3/convert-to-coordinates",
-            params={"words": words.strip(), "key": W3W_API_KEY},
+            params={"words": words.strip().lstrip("/").lstrip("/") , "key": W3W_API_KEY},
             timeout=12,
         )
         if r.status_code == 200:
@@ -427,8 +424,8 @@ def fetch_map(lat, lon, zoom=17, size=(1000, 700)) -> Optional[Image.Image]:
     except Exception:
         return None
 
-# ------------------------- AI commentary (offline) -------------------------
-def ai_sections(ctx: Dict) -> Dict[str, str]:
+# ------------------------- AI commentary (ONLINE by default, OFFLINE fallback) -------------------------
+def _offline_ai_sections(ctx: Dict) -> Dict[str, str]:
     feats, wind = ctx["feats"], ctx["wind"]
     slope_pct = ctx["slope_pct"] or 0.0
     risk = ctx["risk"]
@@ -465,6 +462,112 @@ def ai_sections(ctx: Dict) -> Dict[str, str]:
         "Overall Site Suitability": s4,
     }
 
+def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("No OpenAI key")
+
+    model = model or AI_MODEL
+    feats = ctx.get("feats", {})
+    wind = ctx.get("wind", {})
+    risk = ctx.get("risk")
+    site = {
+        "wind": {"mps": wind.get("speed_mps"), "dir_deg": wind.get("deg"), "dir_compass": wind.get("compass")},
+        "slope_pct": ctx.get("slope_pct"),
+        "separations_m": {
+            "building": feats.get("building_m"),
+            "boundary": feats.get("boundary_m"),
+            "road": feats.get("road_m"),
+            "drain": feats.get("drain_m"),
+            "overhead": feats.get("overhead_m"),
+            "rail": feats.get("rail_m"),
+            "watercourse": feats.get("water_m"),
+            "land_use": feats.get("land_class"),
+        },
+        "enclosure_sides": ctx.get("enclosure_sides"),
+        "los_restricted": bool(ctx.get("los_issue")),
+        "vegetation_3m_level": ctx.get("veg_3m"),
+        "risk": {
+            "score": getattr(risk, "score", None),
+            "status": getattr(risk, "status", None),
+            "drivers": getattr(risk, "explain", []),
+        },
+    }
+    system = (
+        "You are a safety and logistics assistant writing concise LPG site pre-check commentary. "
+        "Audience is field engineers; keep it professional, UK terminology. "
+        "Output exactly four sections as plain text paragraphs with these headings: "
+        "Safety Risk Profile; Environmental Considerations; Access & Logistics; Overall Site Suitability."
+    )
+    user = (
+        "Using this site context, write those four sections (short, specific, actionable). "
+        "Avoid repeating all numbers verbatim unless helpful; focus on implications. "
+        f"Context:\n{json.dumps(site, ensure_ascii=False)}"
+    )
+
+    try:
+        r = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 450,
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        content = (r.json()["choices"][0]["message"]["content"] or "").strip()
+    except Exception as e:
+        raise RuntimeError(f"OpenAI error: {e}")
+
+    sections = {
+        "Safety Risk Profile": "",
+        "Environmental Considerations": "",
+        "Access & Logistics": "",
+        "Overall Site Suitability": "",
+    }
+    text = content.replace("\r\n", "\n")
+    anchors = [
+        ("Safety Risk Profile", "Safety Risk Profile"),
+        ("Environmental Considerations", "Environmental Considerations"),
+        ("Access & Logistics", "Access & Logistics"),
+        ("Overall Site Suitability", "Overall Site Suitability"),
+    ]
+    current = None
+    for line in text.split("\n"):
+        l = line.strip().lstrip("#").strip()
+        if not l:
+            continue
+        found = False
+        for key, anchor in anchors:
+            if l.lower().startswith(anchor.lower()):
+                current = key
+                found = True
+                break
+        if found:
+            continue
+        if current is None:
+            current = "Safety Risk Profile"
+        sections[current] += (("" if sections[current] == "" else " ") + l)
+
+    return sections
+
+def ai_sections(ctx: Dict) -> Dict[str, str]:
+    """Try online; fallback to offline if key missing or error."""
+    if OPENAI_API_KEY:
+        try:
+            return _online_ai_sections(ctx)
+        except Exception:
+            pass
+    return _offline_ai_sections(ctx)
+
 # ------------------------- UI helper: seeded, editable distance -------------------------
 def nm_distance(
     label: str,
@@ -473,13 +576,7 @@ def nm_distance(
     max_val: float = 2000.0,
     seed_tag: Optional[str] = None,
 ) -> Optional[float]:
-    """
-    - Always editable number input (works inside st.form)
-    - Auto-seeds from current W3W (seed_tag) so boxes show fetched values
-    - Returns None when 'Not mapped' is ticked
-    """
     tag = seed_tag or "__default__"
-
     if st.session_state.get(f"{key}__seed") != tag:
         st.session_state[f"{key}__nm"]  = (auto_val is None)
         st.session_state[f"{key}__val"] = 0.0 if auto_val is None else float(auto_val)
@@ -498,7 +595,6 @@ def nm_distance(
 
     st.session_state[f"{key}__val"] = val
     st.session_state[f"{key}__nm"]  = nm
-
     return None if nm else float(val)
 
 # ------------------------- Pretty key/value block -------------------------
@@ -508,7 +604,6 @@ def kv_block(title: str, data: Dict, cols: int = 2, fmt: Dict[str, str] | None =
     keys = list(data.keys())
     rows = (len(keys) + cols - 1) // cols
     fmt = fmt or {}
-    # normalize values
     def show(k, v):
         if v is None:
             return "—"
@@ -553,7 +648,7 @@ else:
     with header_cols[0]:
         st.title("LPG Customer Tank — Pre-Check")
     with header_cols[1]:
-        if os.path_exists(COMPANY_LOGO) and is_authed():
+        if os.path.exists(COMPANY_LOGO) and is_authed():
             st.image(COMPANY_LOGO, use_container_width=True)
 
 st.caption("Enter a what3words location, review/edit auto-filled data, then confirm to assess.")
@@ -582,11 +677,10 @@ if reset:
 
 # ------------------------- Run handler -------------------------
 if run:
-    w3w_clean = (w3w_input or "").strip()
+    w3w_clean = (w3w_input or "").strip().removeprefix("///").removeprefix("/")
     if not w3w_clean or w3w_clean.count(".") != 2:
         st.error("Please enter a valid what3words (word.word.word).")
     else:
-        # Clear previous auto so sections hide while spinner shows
         st.session_state.pop("auto", None)
         st.session_state["w3w"] = w3w_clean
         with st.status("Fetching site data…", expanded=False):
@@ -608,7 +702,7 @@ if run:
                 "wind_mps": wind.get("speed_mps") or 0.0,
                 "wind_deg": wind.get("deg") or 0,
                 "wind_comp": wind.get("compass") or "n/a",
-                "slope_pct": 3.5,      # optional: add elevation service later
+                "slope_pct": 3.5,
                 "approach_avg": 0.9,
                 "approach_max": 3.5,
                 **feats,
@@ -709,7 +803,6 @@ if auto:
         tc_col = st.columns(4)[0]
         with tc_col:
             turning_circle_m = st.number_input("Turning circle (m)", 8.0, 30.0, float(st.session_state.get(f"{basekey}_turning_circle_m", preset["turning_circle_m"])), 0.1, key="veh_tc_in")
-        # persist per vehicle
         st.session_state[f"{basekey}_length_m"] = veh_length_m
         st.session_state[f"{basekey}_width_m"]  = veh_width_m
         st.session_state[f"{basekey}_height_m"] = veh_height_m
@@ -758,7 +851,6 @@ if auto:
             veg_3m=veg_3m, open_field_m=open_field_m
         )
 
-        # pack edited address + hospital for export
         addr_edited = {
             "road": addr_road, "city": addr_city, "postcode": addr_postcode,
             "local_authority": addr_local,
@@ -1035,8 +1127,3 @@ if auto:
                 )
             else:
                 st.caption("PDF generation unavailable on this host (ReportLab not installed).")
-
-
-
-
-
