@@ -917,20 +917,30 @@ def build_pdf_report(ctx: Dict) -> bytes:
 
     ###
     def _kv_table(d: Dict, ncols=2):
+        # Flatten into rows of key/value; auto split into ncols*2 table
         items = list(d.items())
     
         rows = []
-        for i in range(0, len(items), ncols):
-            slice_items = items[i:i+ncols]
+        if items:
+            for i in range(0, len(items), ncols):
+                slice_items = items[i:i+ncols]
+                row = []
+                for k, v in slice_items:
+                    row.append(Paragraph(f"<b>{k}:</b>", styleN))
+                    row.append(Paragraph(str(v if v not in (None, "") else "—"), styleN))
+                # pad if last row short
+                while len(row) < ncols * 2:
+                    row.append("")
+                rows.append(row)
+        else:
+            # ensure at least one row/column exists even when dict is empty
             row = []
-            for k, v in slice_items:
-                row.append(Paragraph(f"<b>{k}:</b>", styleN))
-                row.append(Paragraph(str(v if v not in (None, "") else "—"), styleN))
-            while len(row) < ncols*2:
-                row.append("")
+            for _ in range(ncols):
+                row += ["", Paragraph("—", styleN)]
+            rows = [row]
     
-        # Two-column block: (30mm key, 58mm value) × ncols  ->  (30+58)*2 = 176mm fits A4 printable width
-        t = Table(rows, colWidths=[30*mm, 58*mm]*ncols, hAlign="LEFT")
+        # Wider value cells to avoid overlap/wrap issues
+        t = Table(rows, colWidths=[30*mm, 58*mm] * ncols, hAlign="LEFT")
         t.setStyle(TableStyle([
             ("VALIGN",        (0,0), (-1,-1), "TOP"),
             ("BOTTOMPADDING", (0,0), (-1,-1), 4),
@@ -938,6 +948,7 @@ def build_pdf_report(ctx: Dict) -> bytes:
             ("RIGHTPADDING",  (0,0), (-1,-1), 6),
         ]))
         return t
+
 
 
         # rows is a list of small 1-row tables to get nice vertical spacing
@@ -2004,6 +2015,7 @@ if auto:
                         )
                     else:
                         st.info("No vehicle-specific conflicts detected in the analysed segment.")
+
 
 
 
