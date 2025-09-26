@@ -1079,14 +1079,21 @@ def build_pdf_report(ctx: Dict) -> bytes:
     dep3 = ctx.get("nearest_depots") or []
     if dep3:
         story += [_title("Top 3 nearest depots (crow-fly)")]
-        rows = [["Depot", "Distance (miles)"]] + [[d["name"], f"{d['miles']:.1f}"] for d in dep3]
-        t = Table(rows, colWidths=[70*mm, 35*mm])
+        rows = [["Depot", "Distance (miles)"]] + [
+            [d["name"], f"{d['miles']:.1f}"] for d in dep3
+        ]
+        t = Table(
+            rows,
+            colWidths=[70*mm, 35*mm],
+            hAlign="LEFT"   # <<< force table left alignment
+        )
         t.setStyle(TableStyle([
             ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
             ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
             ("ALIGN", (1,1), (-1,-1), "RIGHT"),
         ]))
         story += [t, Spacer(1, 3*mm)]
+
 
     # ---------- ROUTE SNAPSHOT ----------
     rs = ctx.get("route_snap", {}) or {}
@@ -2015,6 +2022,7 @@ if auto:
                         )
                     else:
                         st.info("No vehicle-specific conflicts detected in the analysed segment.")
+
 
 
 
