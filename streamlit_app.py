@@ -1430,6 +1430,9 @@ if auto:
             "hospital_name": hosp_name,
             "hospital_distance_m": (auto.get("hospital", {}) or {}).get("distance_m", None),
         }
+
+        left, right = st.columns([0.45, 0.55])
+
 # ---------- NICE MULTI-PAGE PDF (Platypus) ----------
 def build_pdf_report(ctx: Dict) -> bytes:
     """
@@ -1615,9 +1618,7 @@ def build_pdf_report(ctx: Dict) -> bytes:
     # ---------- build ----------
     doc.build(story)
     return buf.getvalue()
-
-        left, right = st.columns([0.45, 0.55])
-
+        
         with left:
             kv_block(
                 "Key metrics",
@@ -1911,6 +1912,7 @@ def build_pdf_report(ctx: Dict) -> bytes:
                         )
                     else:
                         st.info("No vehicle-specific conflicts detected in the analysed segment.")
+
 
 
 
