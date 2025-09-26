@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 import streamlit as st
 from PIL import Image
+import pandas as pd
+
 
 # ------------------------- Page config -------------------------
 PAGE_ICON = "icon.png" if os.path.exists("icon.png") else None
@@ -904,10 +906,18 @@ if auto:
 
         depots3 = auto.get("nearest_depots") or nearest_depots(auto["lat"], auto["lon"], n=3)
         st.caption("Top 3 nearest depots (crow-fly)")
-        st.table(
-            {"Depot": [d["name"] for d in depots3],
-             "Distance (miles)": [round(d["miles"], 1) for d in depots3]}
-        )
+        rows = [{"Depot": d["name"], "Distance (miles)": d["miles"]} for d in depots3]
+        df = pd.DataFrame(rows)
+        
+        # Make the index 1,2,3 instead of 0,1,2
+        df.index = range(1, len(df) + 1)
+        df.index.name = ""  # hide index header
+        
+        # Left-align by rendering as text and format to 1 decimal
+        df["Distance (miles)"] = df["Distance (miles)"].map(lambda x: f"{x:.1f}")
+        
+        st.table(df)
+
 
         st.markdown("---")
         st.subheader("Site options")
@@ -1228,3 +1238,4 @@ if auto:
                 )
             else:
                 st.caption("PDF generation unavailable on this host (ReportLab not installed).")
+
