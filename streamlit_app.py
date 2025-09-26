@@ -1,11 +1,11 @@
+# streamlit_app.py
 import os, io, math, json, requests, re
 from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass
 
 import streamlit as st
-from PIL import Image
 import pandas as pd
-
+from PIL import Image
 
 # ------------------------- Page config -------------------------
 PAGE_ICON = "icon.png" if os.path.exists("icon.png") else None
@@ -29,7 +29,7 @@ MAPBOX_TOKEN   = get_secret("MAPBOX_TOKEN")
 APP_PASSWORD   = get_secret("APP_PASSWORD", "")  # <-- password lives with your API keys
 AI_MODEL       = get_secret("AI_MODEL", "gpt-4o-mini")  # optional override
 
-UA = {"User-Agent": "LPG-Precheck/1.8"}
+UA = {"User-Agent": "LPG-Precheck/1.9"}
 
 # ------------------------- Auth + status helpers -------------------------
 def is_authed() -> bool:
@@ -87,36 +87,42 @@ VEHICLE_PRESETS = {
     "LPG Tanker (Long Rigid)":{"length_m": 11.0, "width_m": 2.5, "height_m": 3.7, "turning_circle_m": 21.0},
 }
 
-# ------------------------- Depots (your list) -------------------------
-DEPOTS = [
-    {"name": "Blaydon",       "lat": 54.9756187, "lon": -1.744101},
-    {"name": "Buckfastleigh", "lat": 50.4869034, "lon": -3.7833235},
-    {"name": "Burton",        "lat": 52.7768106, "lon": -1.559383},
-    {"name": "Cairnhill",     "lat": 57.3820238, "lon": -2.556494},
-    {"name": "Carlisle",      "lat": 54.898308,  "lon": -2.950747},
-    {"name": "Conwy",         "lat": 53.2876319, "lon": -3.8574551},
-    {"name": "Defford",       "lat": 52.0883951, "lon": -2.161253},
-    {"name": "Evanton",       "lat": 57.6723499, "lon": -4.3069473},
-    {"name": "Fawley",        "lat": 50.8490674, "lon": -1.3778735},
-    {"name": "Grangemouth",   "lat": 56.0224567, "lon": -3.7212715},
-    {"name": "Knowsley",      "lat": 53.4630737, "lon": -2.8682086},
-    {"name": "Launceston",    "lat": 50.6278182, "lon": -4.3922685},
-    {"name": "Leeds",         "lat": 53.7829647, "lon": -1.5059716},
-    {"name": "Llandarcy",     "lat": 51.6391619, "lon": -3.8451237},
-    {"name": "Ludham",        "lat": 52.7241592, "lon":  1.5499137},
-    {"name": "Newport",       "lat": 51.5675306, "lon": -2.9782096},
-    {"name": "Paisley",       "lat": 55.8532784, "lon": -4.424505},
-    {"name": "Perth",         "lat": 56.4169938, "lon": -3.4755149},
-    {"name": "Peterborough",  "lat": 52.5776289, "lon": -0.2142451},
-    {"name": "Presteigne",    "lat": 52.2688513, "lon": -2.9945084},
-    {"name": "Rainham",       "lat": 51.509824,  "lon":  0.1698276},
-    {"name": "Sittingbourne", "lat": 51.3850881, "lon":  0.7530866},
-    {"name": "Skegness",      "lat": 53.2554345, "lon":  0.2666851},
-    {"name": "Staveley",      "lat": 53.2761913, "lon": -1.355699},
-    {"name": "Stoke",         "lat": 52.9648079, "lon": -2.1676655},
-    {"name": "Swinton",       "lat": 55.7230767, "lon": -2.2697802},
-    {"name": "Witney",        "lat": 51.7926625, "lon": -1.5068047},
-    {"name": "Wrexham",       "lat": 53.0264358, "lon": -2.9252352},
+# Assumed gross weights (tonnes) for restrictions comparison
+VEHICLE_GVW_T = {
+    "3.5t Van": 3.5, "7.5t Rigid": 7.5, "18t Rigid": 18.0, "26t Rigid": 26.0,
+    "Artic (44t)": 44.0, "LPG Tanker (Urban)": 26.0, "LPG Tanker (Long Rigid)": 26.0,
+}
+
+# ------------------------- Depot list -------------------------
+DEPOTS: List[Dict[str, float]] = [
+    {"name":"Blaydon","lon":-1.744101,"lat":54.9756187},
+    {"name":"Buckfastleigh","lon":-3.7833235,"lat":50.4869034},
+    {"name":"Burton","lon":-1.559383,"lat":52.7768106},
+    {"name":"Cairnhill","lon":-2.556494,"lat":57.3820238},
+    {"name":"Carlisle","lon":-2.950747,"lat":54.898308},
+    {"name":"Conwy","lon":-3.8574551,"lat":53.2876319},
+    {"name":"Defford","lon":-2.161253,"lat":52.0883951},
+    {"name":"Evanton","lon":-4.3069473,"lat":57.6723499},
+    {"name":"Fawley","lon":-1.3778735,"lat":50.8490674},
+    {"name":"Grangemouth","lon":-3.7212715,"lat":56.0224567},
+    {"name":"Knowsley","lon":-2.8682086,"lat":53.4630737},
+    {"name":"Launceston","lon":-4.3922685,"lat":50.6278182},
+    {"name":"Leeds","lon":-1.5059716,"lat":53.7829647},
+    {"name":"Llandarcy","lon":-3.8451237,"lat":51.6391619},
+    {"name":"Ludham","lon":1.5499137,"lat":52.7241592},
+    {"name":"Newport","lon":-2.9782096,"lat":51.5675306},
+    {"name":"Paisley","lon":-4.424505,"lat":55.8532784},
+    {"name":"Perth","lon":-3.4755149,"lat":56.4169938},
+    {"name":"Peterborough","lon":-0.2142451,"lat":52.5776289},
+    {"name":"Presteigne","lon":-2.9945084,"lat":52.2688513},
+    {"name":"Rainham","lon":0.1698276,"lat":51.509824},
+    {"name":"Sittingbourne","lon":0.7530866,"lat":51.3850881},
+    {"name":"Skegness","lon":0.2666851,"lat":53.2554345},
+    {"name":"Staveley","lon":-1.355699,"lat":53.2761913},
+    {"name":"Stoke","lon":-2.1676655,"lat":52.9648079},
+    {"name":"Swinton","lon":-2.2697802,"lat":55.7230767},
+    {"name":"Witney","lon":-1.5068047,"lat":51.7926625},
+    {"name":"Wrexham","lon":-2.9252352,"lat":53.0264358},
 ]
 
 # ------------------------- Geom helpers -------------------------
@@ -154,31 +160,6 @@ def dist_poly(lat0, lon0, poly):
     if not poly or len(poly) < 3:
         return None
     return dist_line(lat0, lon0, poly + poly[:1])
-
-# Great-circle (Haversine) distance in miles
-def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    R_km = 6371.0088
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dl/2)**2
-    km = 2 * R_km * math.asin(math.sqrt(a))
-    return km * 0.621371
-
-def nearest_depot(lat: float, lon: float) -> Dict[str, Optional[float]]:
-    best = None
-    for d in DEPOTS:
-        miles = haversine_miles(lat, lon, d["lat"], d["lon"])
-        if best is None or miles < best["miles"]:
-            best = {"name": d["name"], "miles": miles, "lat": d["lat"], "lon": d["lon"]}
-    return best or {"name": "n/a", "miles": None, "lat": None, "lon": None}
-
-def nearest_depots(lat: float, lon: float, n: int = 3) -> List[Dict[str, float]]:
-    ranked = []
-    for d in DEPOTS:
-        ranked.append({"name": d["name"], "miles": haversine_miles(lat, lon, d["lat"], d["lon"])})
-    ranked.sort(key=lambda x: x["miles"])
-    return ranked[:n]
 
 # ------------------------- External data -------------------------
 def w3w_to_latlon(words: str) -> Tuple[Optional[float], Optional[float]]:
@@ -362,9 +343,6 @@ def parse_osm(lat0, lon0, data) -> Dict:
     over_candidates = [dist_line(lat0, lon0, l) for l in plines]
     if pnodes:
         pn = min(_dist_m(lat0, lon0, la, lo) for la,lo in pnodes)
-    else:
-        pn = None
-    if pn is not None:
         over_candidates.append(pn)
     d_over = _min_clean(over_candidates)
 
@@ -524,6 +502,11 @@ def _offline_ai_sections(ctx: Dict) -> Dict[str, str]:
     }
 
 def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
+    """
+    Call OpenAI for commentary and robustly parse output into four sections.
+    Safer parser: only treats headings at line-start as headings; inline headings
+    are only recognized if followed by ':' or a dash.
+    """
     if not OPENAI_API_KEY:
         raise RuntimeError("No OpenAI key")
 
@@ -571,6 +554,7 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
         f"Context:\n{json.dumps(site, ensure_ascii=False)}"
     )
 
+    # --- Call OpenAI
     try:
         r = requests.post(
             "https://api.openai.com/v1/chat/completions",
@@ -594,8 +578,9 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
     except Exception as e:
         raise RuntimeError(f"OpenAI error: {e}")
 
+    # --- Robust parsing into 4 sections
     text = (content or "").replace("\r\n", "\n").strip()
-    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)  # drop bold markers
 
     section_keys = [
         "Safety Risk Profile",
@@ -605,6 +590,7 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
     ]
     sections = {k: "" for k in section_keys}
 
+    # Primary pass: headings MUST be at start of line (markdown ### / bold allowed, optional colon)
     head_line_re = re.compile(
         r"(?im)^\s*(?:#+\s*)?(?:\*\*)?(Safety Risk Profile|Environmental Considerations|Access & Logistics|Overall Site Suitability)(?:\*\*)?\s*:?\s*"
     )
@@ -624,6 +610,7 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
 
     found = slice_by_matches(text)
 
+    # Fallback pass for inline headings followed by ':' or '-' only
     if sum(bool(v) for v in found.values()) < 2:
         inline = text
         for k in section_keys:
@@ -642,12 +629,185 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
     return sections
 
 def ai_sections(ctx: Dict) -> Dict[str, str]:
+    """Try online; fallback to offline if key missing or error."""
     if OPENAI_API_KEY:
         try:
             return _online_ai_sections(ctx)
         except Exception:
             pass
     return _offline_ai_sections(ctx)
+
+# ------------------------- Nearest depots + routing -------------------------
+def haversine_m(lat1, lon1, lat2, lon2) -> float:
+    R = 6371008.8
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dl/2)**2
+    return 2 * R * math.asin(math.sqrt(a))
+
+def nearest_depots(lat: float, lon: float, n: int = 3) -> List[Dict]:
+    rows = []
+    for d in DEPOTS:
+        dm = haversine_m(lat, lon, d["lat"], d["lon"])
+        rows.append({"name": d["name"], "lat": d["lat"], "lon": d["lon"], "miles": dm/1609.34})
+    rows.sort(key=lambda x: x["miles"])
+    return rows[:n]
+
+def mapbox_route(origin: Tuple[float,float], dest: Tuple[float,float]) -> Dict:
+    """Fetch route with Mapbox Directions (driving). Returns coords, distance_m, duration_s."""
+    if not MAPBOX_TOKEN:
+        return {"coords": [], "distance_m": None, "duration_s": None}
+    o_lat, o_lon = origin; d_lat, d_lon = dest
+    url = (
+        f"https://api.mapbox.com/directions/v5/mapbox/driving/"
+        f"{o_lon},{o_lat};{d_lon},{d_lat}"
+    )
+    try:
+        r = requests.get(
+            url,
+            params={
+                "geometries": "geojson",
+                "overview": "full",
+                "steps": "false",
+                "access_token": MAPBOX_TOKEN,
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        j = r.json()
+        routes = j.get("routes") or []
+        if not routes:
+            return {"coords": [], "distance_m": None, "duration_s": None}
+        route = routes[0]
+        coords = route.get("geometry", {}).get("coordinates", [])  # [ [lon,lat], ... ]
+        return {
+            "coords": coords,
+            "distance_m": float(route.get("distance", 0.0)),
+            "duration_s": float(route.get("duration", 0.0)),
+        }
+    except Exception:
+        return {"coords": [], "distance_m": None, "duration_s": None}
+
+def cumulative_lengths_m(coords: List[Tuple[float, float]]) -> List[float]:
+    acc = [0.0]
+    for (la1, lo1), (la2, lo2) in zip(coords, coords[1:]):
+        acc.append(acc[-1] + haversine_m(la1, lo1, la2, lo2))
+    return acc
+
+def crop_last_miles(coords: List[List[float]], miles: float = 20.0) -> List[List[float]]:
+    """Return last `miles` of the route (coords in [lon,lat])."""
+    if not coords:
+        return coords
+    latlon = [(c[1], c[0]) for c in coords]
+    cl = cumulative_lengths_m(latlon)
+    want = miles * 1609.34
+    total = cl[-1]
+    if total <= want:
+        return coords
+    start = 0
+    target = total - want
+    for i, d in enumerate(cl):
+        if d >= target:
+            start = i
+            break
+    return coords[start:]
+
+def bbox_of_coords(coords: List[List[float]], pad_deg: float = 0.02):
+    lons = [c[0] for c in coords]; lats = [c[1] for c in coords]
+    return min(lats)-pad_deg, min(lons)-pad_deg, max(lats)+pad_deg, max(lons)+pad_deg
+
+def dist_to_polyline_m(lat0, lon0, line_lonlat: List[List[float]]) -> float:
+    best = None
+    if len(line_lonlat) < 2:
+        return float("inf")
+    lat_ref = lat0
+    mlat, mlon = meters_per_degree(lat_ref)
+    def to_xy(lat, lon): return ( (lon - lon0) * mlon, (lat - lat0) * mlat )
+    px, py = 0.0, 0.0
+    verts = [to_xy(c[1], c[0]) for c in line_lonlat]
+    for (ax, ay), (bx, by) in zip(verts, verts[1:]):
+        apx, apy = px - ax, py - ay
+        abx, aby = bx - ax, by - ay
+        ab2 = abx*abx + aby*aby
+        t = 0.0 if ab2 == 0 else max(0.0, min(1.0, (apx*abx + apy*aby) / ab2))
+        cx, cy = ax + t*abx, ay + t*aby
+        d = math.hypot(px - cx, py - cy)
+        best = d if best is None else min(best, d)
+    return best or float("inf")
+
+def overpass_route_hazards(cropped_coords: List[List[float]]) -> List[Dict]:
+    """Query a single Overpass bbox around the cropped route; filter by distance to route."""
+    if not cropped_coords:
+        return []
+    lat_min, lon_min, lat_max, lon_max = bbox_of_coords(cropped_coords, pad_deg=0.02)
+    q = f"""
+[out:json][timeout:60];
+(
+  way({lat_min},{lon_min},{lat_max},{lon_max})["maxheight"];
+  way({lat_min},{lon_min},{lat_max},{lon_max})["maxwidth"];
+  way({lat_min},{lon_min},{lat_max},{lon_max})["maxweight"];
+  way({lat_min},{lon_min},{lat_max},{lon_max})["hgv"];
+  way({lat_min},{lon_min},{lat_max},{lon_max})["hazmat"];
+  way({lat_min},{lon_min},{lat_max},{lon_max})["bridge"];
+  way({lat_min},{lon_min},{lat_max},{lon_max})["tunnel"];
+  way({lat_min},{lon_min},{lat_max},{lon_max})["ford"];
+  node({lat_min},{lon_min},{lat_max},{lon_max})["ford"="yes"];
+  way({lat_min},{lon_min},{lat_max},{lon_max})["railway"="level_crossing"];
+  node({lat_min},{lon_min},{lat_max},{lon_max})["railway"="level_crossing"];
+  way({lat_min},{lon_min},{lat_max},{lon_max})["barrier"];
+  node({lat_min},{lon_min},{lat_max},{lon_max})["barrier"];
+  way({lat_min},{lon_min},{lat_max},{lon_max})["traffic_calming"];
+  way({lat_min},{lon_min},{lat_max},{lon_max})["highway"~"track|service|living_street"];
+  way({lat_min},{lon_min},{lat_max},{lon_max})["surface"~"gravel|ground|unpaved|grass|dirt"];
+  way({lat_min},{lon_min},{lat_max},{lon_max})["width"];
+);
+out tags center 200;
+"""
+    try:
+        r = requests.post(OVERPASS, data={"data": q}, headers=UA, timeout=90)
+        r.raise_for_status()
+        elements = r.json().get("elements", [])
+    except Exception:
+        elements = []
+
+    issues = []
+    for el in elements:
+        tags = el.get("tags") or {}
+        lat = el.get("lat") or (el.get("center") or {}).get("lat")
+        lon = el.get("lon") or (el.get("center") or {}).get("lon")
+        if lat is None or lon is None:
+            continue
+        d_m = dist_to_polyline_m(lat, lon, cropped_coords)
+        if d_m > 80:
+            continue
+
+        def tagfirst(*keys):
+            for k in keys:
+                if k in tags:
+                    return f"{k}={tags[k]}"
+            return None
+
+        kind = (
+            tagfirst("maxheight","maxwidth","maxweight") or
+            tagfirst("hgv","hazmat","bridge","tunnel","ford","railway","traffic_calming","surface","highway","barrier","width") or
+            "restriction"
+        )
+        issues.append({
+            "lat": lat, "lon": lon, "tag": kind, "tags": tags
+        })
+    return issues
+
+def route_milepost_from_site(feature_lat: float, feature_lon: float, route_coords: List[List[float]]) -> float:
+    """Approximate mile marker from site along the cropped route (0 at site)."""
+    if not route_coords:
+        return float("nan")
+    latlon = [(c[1], c[0]) for c in route_coords]
+    cum = cumulative_lengths_m(latlon)
+    idx = min(range(len(latlon)),
+              key=lambda i: haversine_m(latlon[i][0], latlon[i][1], feature_lat, feature_lon))
+    remaining_m = (cum[-1] - cum[idx])
+    return remaining_m / 1609.34
 
 # ------------------------- UI helper: seeded, editable distance -------------------------
 def nm_distance(
@@ -680,6 +840,7 @@ def nm_distance(
 
 # ------------------------- Pretty key/value block -------------------------
 def kv_block(title: str, data: Dict, cols: int = 2, fmt: Dict[str, str] | None = None):
+    """Pretty key/value block (inline compact)."""
     st.markdown(f"### {title}" if title.lower().startswith("key") else f"#### {title}")
     keys = list(data.keys())
     rows = (len(keys) + cols - 1) // cols
@@ -746,7 +907,7 @@ with c_run:
 with c_reset:
     reset = st.button("Reset", type="secondary", use_container_width=True, key="reset_btn")
 
-# Reset: clear data below and W3W, hide edit/results until new W3W entered
+# Reset
 if reset:
     for k in list(st.session_state.keys()):
         if k.startswith("d_") or k.endswith("__val") or k.endswith("__nm") or k.endswith("__seed") or k.startswith("veh_"):
@@ -774,15 +935,21 @@ if run:
             osm  = overpass_near(lat, lon, radius=400)
             feats = parse_osm(lat, lon, osm)
             hosp = nearest_hospital(lat, lon)
-            depot1 = nearest_depot(lat, lon)
+
+            # Nearest depots + route analysis (last 20 miles)
             depots3 = nearest_depots(lat, lon, n=3)
+            depot1 = depots3[0] if depots3 else None
+            if depot1:
+                route = mapbox_route((depot1["lat"], depot1["lon"]), (lat, lon))
+                cropped = crop_last_miles(route["coords"], miles=20.0)
+                hazards = overpass_route_hazards(cropped)
+            else:
+                route, cropped, hazards = {"coords": [], "distance_m": None, "duration_s": None}, [], []
 
             st.session_state["auto"] = {
                 "lat": lat, "lon": lon,
                 "addr": addr,
                 "hospital": hosp,
-                "nearest_depot": depot1,     # for the read-only fields
-                "nearest_depots": depots3,   # for the top-3 table
                 "wind_mps": wind.get("speed_mps") or 0.0,
                 "wind_deg": wind.get("deg") or 0,
                 "wind_comp": wind.get("compass") or "n/a",
@@ -790,6 +957,10 @@ if run:
                 "approach_avg": 0.9,
                 "approach_max": 3.5,
                 **feats,
+                "nearest_depots": depots3,
+                "route": route,
+                "route_cropped": {"coords": cropped},
+                "route_hazards": hazards,
             }
             st.success("Auto data ready.")
 
@@ -892,33 +1063,162 @@ if auto:
         st.session_state[f"{basekey}_height_m"] = veh_height_m
         st.session_state[f"{basekey}_turning_circle_m"] = turning_circle_m
 
-        # ---------------- Nearest Depot & Logistics (Top 3) ----------------
+        # ---------------- Nearest depot & logistics ----------------
         st.markdown("---")
         st.subheader("Nearest Depot & Logistics")
-        nd = auto.get("nearest_depot") or nearest_depot(auto["lat"], auto["lon"])
-        nd_name = nd["name"] if nd and nd.get("name") else "—"
-        nd_miles = f"{nd['miles']:.1f} miles" if nd and isinstance(nd.get("miles"), (int, float)) else "—"
-        cnd1, cnd2 = st.columns(2)
-        with cnd1:
-            st.text_input("Nearest depot", nd_name, disabled=True, key="nearest_depot_name_ro")
-        with cnd2:
-            st.text_input("Distance (miles)", nd_miles, disabled=True, key="nearest_depot_dist_ro")
-
         depots3 = auto.get("nearest_depots") or nearest_depots(auto["lat"], auto["lon"], n=3)
+        nearest = depots3[0] if depots3 else None
+
+        cnd1, cnd2 = st.columns([0.5, 0.5])
+        with cnd1:
+            st.text_input("Nearest depot", nearest["name"] if nearest else "—", key="nearest_depot_ro", disabled=True)
+        with cnd2:
+            st.text_input("Distance (miles)", f"{nearest['miles']:.1f} miles" if nearest else "—", key="nearest_depot_mi_ro", disabled=True)
+
         st.caption("Top 3 nearest depots (crow-fly)")
         rows = [{"Depot": d["name"], "Distance (miles)": d["miles"]} for d in depots3]
         df = pd.DataFrame(rows)
-        
-        # Make the index 1,2,3 instead of 0,1,2
-        df.index = range(1, len(df) + 1)
-        df.index.name = ""  # hide index header
-        
-        # Left-align by rendering as text and format to 1 decimal
+        df.index = range(1, len(df) + 1); df.index.name = ""
         df["Distance (miles)"] = df["Distance (miles)"].map(lambda x: f"{x:.1f}")
-        
         st.table(df)
 
+        # ---------------- Route analysis (last 20 miles) ----------------
+        st.markdown("#### Route analysis (last 20 miles)")
+        route = auto.get("route") or {}
+        cropped = (auto.get("route_cropped") or {}).get("coords", [])
+        hazards = auto.get("route_hazards") or []
 
+        full_dist_m = route.get("distance_m")
+        full_dur_s = route.get("duration_s")
+
+        def length_m(coords_lonlat: List[List[float]]) -> float:
+            if not coords_lonlat:
+                return 0.0
+            latlon = [(c[1], c[0]) for c in coords_lonlat]
+            return cumulative_lengths_m(latlon)[-1]
+
+        cropped_m = length_m(cropped)
+        st.caption(
+            f"Full route: {(full_dist_m/1609.34):.1f} miles, {(full_dur_s/60.0):.0f} min  •  "
+            f"Analysed segment: {(cropped_m/1609.34):.1f} miles (nearest to site)"
+            if (full_dist_m and full_dur_s) else
+            f"Analysed segment: {(cropped_m/1609.34):.1f} miles (nearest to site)"
+        )
+
+        rows_issues = []
+        veh_height = float(st.session_state.get(f"veh_{vehicle_type}_height_m", VEHICLE_PRESETS[vehicle_type]["height_m"]))
+        veh_width  = float(st.session_state.get(f"veh_{vehicle_type}_width_m",  VEHICLE_PRESETS[vehicle_type]["width_m"]))
+        veh_gvw_t  = float(VEHICLE_GVW_T.get(vehicle_type, 26.0))
+        is_lpg_tanker = "LPG Tanker" in vehicle_type
+
+        for h in hazards:
+            tags = h.get("tags") or {}
+            severity = "INFO"
+            reason = None
+
+            # Height
+            if "maxheight" in tags:
+                try:
+                    v = tags["maxheight"]
+                    mh = None
+                    if "m" in v:
+                        mh = float(re.findall(r"([0-9]+(?:\.[0-9]+)?)", v)[0])
+                    elif "'" in v:
+                        m_ = re.findall(r"(\d+)'(?:\s*(\d+))?\"", v)
+                        if m_:
+                            ft = int(m_[0][0]); inch = int(m_[0][1]) if m_[0][1] else 0
+                            mh = (ft*12 + inch) * 0.0254
+                    else:
+                        mh = float(re.findall(r"([0-9]+(?:\.[0-9]+)?)", v)[0])
+                    if mh is not None:
+                        reason = f"maxheight={mh:.2f} m"
+                        severity = "BLOCKER" if veh_height > mh else "ATTENTION"
+                except Exception:
+                    reason = f"maxheight={tags['maxheight']}"
+                    severity = "ATTENTION"
+
+            # Width
+            if "maxwidth" in tags:
+                try:
+                    mw = float(re.findall(r"([0-9]+(?:\.[0-9]+)?)", tags["maxwidth"])[0])
+                    r2 = f"maxwidth={mw:.2f} m"
+                    if veh_width > mw:
+                        severity = "BLOCKER"; reason = r2
+                    elif severity != "BLOCKER":
+                        severity = "ATTENTION"; reason = reason or r2
+                except Exception:
+                    pass
+
+            # Weight
+            if "maxweight" in tags:
+                try:
+                    mw_t = float(re.findall(r"([0-9]+(?:\.[0-9]+)?)", tags["maxweight"])[0])
+                    r3 = f"maxweight={mw_t:.1f} t"
+                    if veh_gvw_t > mw_t:
+                        severity = "BLOCKER"; reason = r3
+                    elif severity != "BLOCKER":
+                        severity = "ATTENTION"; reason = reason or r3
+                except Exception:
+                    pass
+
+            # Hazmat/HGV/Barriers
+            if tags.get("hazmat") in ("no", "designated"):
+                severity = "BLOCKER"; reason = f"hazmat={tags.get('hazmat')}"
+            if tags.get("hgv") == "no":
+                severity = "BLOCKER"; reason = "hgv=no"
+            if tags.get("barrier") in ("gate","bollard","height_restrictor"):
+                if severity != "BLOCKER":
+                    severity = "ATTENTION"
+                reason = reason or f"barrier={tags.get('barrier')}"
+            if tags.get("ford") == "yes":
+                if severity != "BLOCKER":
+                    severity = "ATTENTION"
+                reason = reason or "ford=yes"
+            if tags.get("railway") == "level_crossing":
+                if severity != "BLOCKER":
+                    severity = "ATTENTION"
+                reason = reason or "level_crossing"
+
+            # Tunnel/Bridge
+            if tags.get("tunnel"):
+                # LPG tankers not allowed in tunnels -> BLOCKER
+                if is_lpg_tanker:
+                    severity = "BLOCKER"
+                    reason = "tunnel (LPG prohibited)"
+                else:
+                    reason = reason or "tunnel"
+            if tags.get("bridge"):
+                reason = reason or "bridge"
+
+            # Poor road class/surface
+            if tags.get("highway") in ("track","service","living_street") or \
+               tags.get("surface") in ("gravel","ground","unpaved","grass","dirt"):
+                if severity != "BLOCKER":
+                    severity = "ATTENTION"
+                reason = reason or f"{tags.get('highway') or tags.get('surface')}"
+
+            reason = reason or (h.get("tag") or "restriction")
+            miles_from_site = route_milepost_from_site(h["lat"], h["lon"], cropped)
+
+            rows_issues.append({
+                "Severity": severity,
+                "Issue": reason,
+                "Near (OSM)": tags.get("name") or tags.get("ref") or tags.get("highway") or "",
+                "Mile from site": f"{miles_from_site:.1f}",
+            })
+
+        if rows_issues:
+            df_issues = pd.DataFrame(rows_issues)
+            order = {"BLOCKER": 0, "ATTENTION": 1, "INFO": 2}
+            df_issues["_o"] = df_issues["Severity"].map(order)
+            df_issues["_m"] = df_issues["Mile from site"].astype(float)
+            df_issues = df_issues.sort_values(by=["_o","_m"]).drop(columns=["_o","_m"])
+            df_issues.index = range(1, len(df_issues)+1); df_issues.index.name = ""
+            st.table(df_issues)
+        else:
+            st.caption("No obvious restrictions found within ~80 m of the analysed route segment.")
+
+        # ---------------- Site options ----------------
         st.markdown("---")
         st.subheader("Site options")
         v1, v2 = st.columns([0.5, 0.5])
@@ -1238,4 +1538,3 @@ if auto:
                 )
             else:
                 st.caption("PDF generation unavailable on this host (ReportLab not installed).")
-
