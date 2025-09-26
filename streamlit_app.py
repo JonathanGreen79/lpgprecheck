@@ -304,6 +304,12 @@ out tags geom 20;
             break
     return best or {"name": "n/a", "distance_m": None, "lat": None, "lon": None}
 
+def dist_poly(lat0, lon0, poly):
+    if not poly or len(poly) < 3:
+        return None
+    # distance to closed polygon -> reuse line distance, closing the ring
+    return dist_line(lat0, lon0, poly + poly[:1])
+
 def parse_osm(lat0, lon0, data) -> Dict:
     bpolys, roads, drains, manholes, plines, pnodes, rails, wlines, wpolys, land_polys = [],[],[],[],[],[],[],[],[],[]
     for el in data.get("elements", []):
@@ -1494,3 +1500,4 @@ if auto:
                 )
             else:
                 st.caption("PDF generation unavailable on this host (ReportLab not installed).")
+
