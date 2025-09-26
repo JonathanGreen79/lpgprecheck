@@ -493,16 +493,98 @@ def quick_route_snapshot(dep: Dict, site_lat: float, site_lon: float) -> Dict:
 
 # ------------------------- NEW: Detailed route analyzer (cached) -------------------------
 @st.cache_data(show_spinner=False, ttl=3600)
-def detailed_route_analysis(dep_name: str, site_lat: float, site_lon: float, last_miles: float = 20.0) -> Dict:
-    """Heavy (cached) analysis returning path + flagged steps for map/table."""
+def detailed_route_analysis(
+    dep_name: str,
+    site_lat: float,
+    site_lon: float,
+    last_miles: float = 20.0,
+    vehicle: Dict | None = None,
+) -> Dict:
+    """
+    Heavy (cached) route analyzer:
+      • pulls full OSRM route from DEPOT->SITE
+      • extracts step maneuvers, computes remaining distance to site
+      • regex-parses height/width/weight limits + compares to vehicle
+      • returns path coords + per-flag conflict records for UI (map/table/CSV)
+    vehicle can include:
+      { "height_m": float, "width_m": float, "turning_circle_m": float,
+        "length_m": float, "mass_t": Optional[float] }
+    """
+
+    # --- helpers: unit parsing ------------------------------------------------
+    def _ftin_to_m(ft: float, inch: float = 0.0) -> float:
+        return (ft * 0.3048) + (inch * 0.0254)
+
+    # returns dict like {"height_m": 3.9} or {"width_m": 2.0} or {"weight_t": 7.5}
+    def parse_limits(raw: str) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        s = raw.lower()
+
+        # Height (metres)
+        m1 = re.findall(r'(\d+(?:\.\d+)?)\s*(?:m|metres|meters)\b', s)
+        # Height (ft/in), formats: 6\'6", 6’6”, 6 ft 6 in, 6ft, 6’6
+        m2 = re.findall(
+            r'(\d+)\s*(?:ft|foot|feet|\'|’)\s*(\d{1,2})?\s*(?:in|\"|”)?',
+            s
+        )
+        # Width (metres) — look for words width / wide near a number
+        m3 = re.findall(r'(?:width|wide)\D{0,10}?(\d+(?:\.\d+)?)\s*(?:m|metres|meters)\b', s)
+        # Width (ft/in)
+        m4 = re.findall(
+            r'(?:width|wide)\D{0,10}?(\d+)\s*(?:ft|foot|feet|\'|’)\s*(\d{1,2})?\s*(?:in|\"|”)?',
+            s
+        )
+        # Weight (tonnes/tons)
+        m5 = re.findall(r'(\d+(?:\.\d+)?)\s*(?:t|ton|tons|tonne|tonnes)\b', s)
+
+        # Heuristics: if "low bridge" exists and there is an m/ft number without the word width nearby
+        # treat it as height even if "width" word not present.
+        if "low bridge" in s or "height" in s or "clearance" in s:
+            # prefer explicit metres
+            if m1:
+                try: out["height_m"] = float(m1[0])
+                except: pass
+            elif m2:
+                ft = float(m2[0][0]); inch = float(m2[0][1] or 0)
+                out["height_m"] = _ftin_to_m(ft, inch)
+
+        # Width
+        if "width" in s or "narrow" in s:
+            if m3:
+                try: out["width_m"] = float(m3[0])
+                except: pass
+            elif m4:
+                ft = float(m4[0][0]); inch = float(m4[0][1] or 0)
+                out["width_m"] = _ftin_to_m(ft, inch)
+
+        # If we saw a metres figure but context looked like width (e.g., "width 2.1 m"), keep it.
+        # If not, leave to height logic above.
+
+        # Weight
+        if ("weight" in s or "tonnage" in s or "mgw" in s or "gvw" in s) and m5:
+            try: out["weight_t"] = float(m5[0])
+            except: pass
+
+        # Generic patterns (e.g. "4.2m limit") when keywords are omitted:
+        if "m" in s and not out.get("height_m") and not out.get("width_m"):
+            # try to guess from keywords near the number
+            # height keywords
+            if re.search(r'(height|clearance|low\s*bridge)', s):
+                if m1:
+                    out["height_m"] = float(m1[0])
+            # width keywords already handled
+
+        return out
+
+    # --- depot lookup & route fetch ------------------------------------------
     try:
         dep_lon, dep_lat = next((dlon, dlat) for (nm, dlon, dlat) in DEPOTS if nm == dep_name)
     except StopIteration:
-        return {"path": [], "steps": [], "flags": [], "counts": {}, "miles": None, "eta_min": None}
+        return {"path": [], "steps": [], "flags": [], "counts": {}, "miles": None, "eta_min": None, "conflicts": [], "summary": {}}
 
     route = osrm_route(dep_lat, dep_lon, site_lat, site_lon, overview=True, steps=True)
     if not route:
-        return {"path": [], "steps": [], "flags": [], "counts": {}, "miles": None, "eta_min": None}
+        return {"path": [], "steps": [], "flags": [], "counts": {}, "miles": None, "eta_min": None, "conflicts": [], "summary": {}}
 
     path = route.get("geometry", {}).get("coordinates") or []
 
@@ -510,6 +592,7 @@ def detailed_route_analysis(dep_name: str, site_lat: float, site_lon: float, las
     for leg in route.get("legs", []) or []:
         steps.extend(leg.get("steps", []) or [])
 
+    # distance remaining to site per step
     remaining = 0.0
     rem_list = []
     for stp in reversed(steps):
@@ -517,52 +600,150 @@ def detailed_route_analysis(dep_name: str, site_lat: float, site_lon: float, las
         remaining += stp.get("distance", 0.0)
     rem_list = list(reversed(rem_list))
 
-    rx = {
-        "gate/barrier": r"\b(gate|barrier)\b",
+    cutoff_m = float(last_miles) * 1609.344
+
+    # quick keyword counts (for your existing badges)
+    base_rx = {
+        "barrier_gate": r"\b(gate|barrier)\b",
         "bollard": r"\b(bollard|bollards)\b",
-        "tunnel/underpass": r"\b(tunnel|underpass)\b",
+        "tunnel": r"\b(tunnel|underpass)\b",
         "ford": r"\b(ford)\b",
-        "narrow/width": r"\b(narrow|width)\b",
-        "weight": r"\b(weight|tonnage)\b",
-        "height/clearance": r"\b(height|low\s+bridge|clearance)\b",
-        "private/no-through": r"\b(private\s+road|no\s+through)\b",
-        "construction/closure": r"\b(construction|roadworks|closure|closed)\b",
+        "narrow": r"\b(narrow)\b",
+        "weight": r"\b(weight|tonnage|mgw|gvw)\b",
+        "height": r"\b(height|low\s*bridge|clearance)\b",
+        "width": r"\b(width|wide)\b",
+        "private": r"\b(private\s+road|no\s+through)\b",
+        "construction": r"\b(construction|roadworks|closure|closed)\b",
         "rail": r"\b(level\s+crossing|rail)\b",
     }
+    counts = {k: 0 for k in base_rx}
 
-    cutoff_m = float(last_miles) * 1609.344
-    recs, flag_points, counts = [], [], {k: 0 for k in rx.keys()}
+    # vehicle inputs
+    veh_h = (vehicle or {}).get("height_m")
+    veh_w = (vehicle or {}).get("width_m")
+    veh_mass = (vehicle or {}).get("mass_t")   # optional; may be None
+    veh_turn = (vehicle or {}).get("turning_circle_m")
+
+    conflicts = []   # rows to display
+    flag_points = [] # map pins
+    disp_rows = []   # full (flagged) rows for table/CSV
 
     for idx, stp in enumerate(steps):
         rem = rem_list[idx]
         if rem > cutoff_m:
             continue
-        txt = " ".join([
+
+        raw_txt = " ".join([
             str(stp.get("name") or ""),
             str(stp.get("ref") or ""),
             str(stp.get("maneuver", {}).get("instruction") or "")
-        ]).lower()
-        hit = [k for k, pat in rx.items() if re.search(pat, txt)]
-        if not hit:
-            continue
-        loc = stp.get("maneuver", {}).get("location") or [None, None]
-        lon, lat = (loc[0], loc[1]) if len(loc) == 2 else (None, None)
-        for h in hit:
-            counts[h] += 1
-        recs.append({
-            "Step #": idx + 1,
-            "Road": stp.get("name") or stp.get("ref") or "(unnamed)",
-            "Instruction": stp.get("maneuver", {}).get("instruction") or "",
-            "Distance to site (mi)": round(rem / 1609.344, 2),
-            "Flags": ", ".join(hit),
-            "_lat": lat, "_lon": lon,
-        })
-        if lat is not None and lon is not None:
-            flag_points.append({"lat": lat, "lon": lon, "flags": ", ".join(hit), "name": stp.get("name") or ""})
+        ])
+        txt = raw_txt.lower()
+
+        # update simple counts
+        for k, pat in base_rx.items():
+            if re.search(pat, txt):
+                counts[k] += 1
+
+        # parse numeric limits
+        lims = parse_limits(raw_txt)
+
+        verdicts = []
+        reason_bits = []
+
+        # Height compare
+        if "height_m" in lims and veh_h is not None:
+            limit = lims["height_m"]
+            if veh_h > limit:
+                verdicts.append("BLOCKER")
+                reason_bits.append(f"height limit {limit:.2f} m vs vehicle {veh_h:.2f} m")
+            else:
+                verdicts.append("PASS")
+
+        # Width compare
+        if "width_m" in lims and veh_w is not None:
+            limit = lims["width_m"]
+            if veh_w > limit:
+                verdicts.append("BLOCKER")
+                reason_bits.append(f"width limit {limit:.2f} m vs vehicle {veh_w:.2f} m")
+            else:
+                verdicts.append("PASS")
+
+        # Weight compare (optional)
+        if "weight_t" in lims:
+            limit = lims["weight_t"]
+            if veh_mass is None:
+                verdicts.append("ATTENTION")
+                reason_bits.append(f"weight limit {limit:.1f} t (vehicle weight unknown)")
+            else:
+                if veh_mass > limit:
+                    verdicts.append("BLOCKER")
+                    reason_bits.append(f"weight limit {limit:.1f} t vs vehicle {veh_mass:.1f} t")
+                else:
+                    verdicts.append("PASS")
+
+        # If no numeric limits but step says narrow/tunnel/… we can mark ATTENTION
+        if not lims and re.search(r'\bnarrow\b', txt) and veh_w is not None:
+            # heuristic: very wide vehicles should be careful on narrow road
+            if veh_w >= 2.55:
+                verdicts.append("ATTENTION")
+                reason_bits.append("narrow road noted")
+
+        # Save only steps that had any limit or notable keyword
+        if lims or reason_bits:
+            loc = stp.get("maneuver", {}).get("location") or [None, None]
+            lon, lat = (loc[0], loc[1]) if len(loc) == 2 else (None, None)
+            step_verdict = "PASS"
+            if "BLOCKER" in verdicts:
+                step_verdict = "BLOCKER"
+            elif "ATTENTION" in verdicts:
+                step_verdict = "ATTENTION"
+
+            row = {
+                "Distance to site (mi)": round(rem / 1609.344, 2),
+                "Road": stp.get("name") or stp.get("ref") or "(unnamed)",
+                "Instruction": stp.get("maneuver", {}).get("instruction") or "",
+                "Restriction": ", ".join([f"{k}={v}" for k, v in lims.items()]) if lims else "advisory",
+                "Vehicle": f"H={veh_h or 'n/a'}m • W={veh_w or 'n/a'}m" + (f" • WT={veh_mass:.1f}t" if veh_mass is not None else ""),
+                "Verdict": step_verdict,
+                "_lat": lat, "_lon": lon,
+            }
+            disp_rows.append(row)
+
+            if lat is not None and lon is not None and step_verdict != "PASS":
+                flag_points.append({"lat": lat, "lon": lon, "flags": step_verdict, "name": row["Restriction"]})
+
+            conflicts.append({"verdict": step_verdict, "why": "; ".join(reason_bits)})
 
     miles = round((route.get("distance") or 0.0) / 1609.344, 1)
     eta_min = round((route.get("duration") or 0.0) / 60.0)
-    return {"path": path, "steps": recs, "flags": flag_points, "counts": counts, "miles": miles, "eta_min": eta_min}
+
+    # overall route verdict
+    if any(c["verdict"] == "BLOCKER" for c in conflicts):
+        overall = "BLOCKER"
+    elif any(c["verdict"] == "ATTENTION" for c in conflicts):
+        overall = "ATTENTION"
+    else:
+        overall = "PASS"
+
+    summary = {
+        "overall": overall,
+        "blockers": sum(1 for c in conflicts if c["verdict"] == "BLOCKER"),
+        "attentions": sum(1 for c in conflicts if c["verdict"] == "ATTENTION"),
+        "counts": counts,
+    }
+
+    return {
+        "path": path,
+        "steps": disp_rows,   # only rows with numeric limits/advisories
+        "flags": flag_points,
+        "counts": counts,
+        "miles": miles,
+        "eta_min": eta_min,
+        "conflicts": conflicts,
+        "summary": summary,
+    }
+
 
 # ------------------------- Risk scoring -------------------------
 CoP = {
@@ -1343,19 +1524,17 @@ if auto:
                 st.info("No notable flags detected within the last 20 miles (based on directions text). A manual review is still recommended.")
 
             # -------- Enhanced analysis: optional map + table ----------
-            # -------- Enhanced analysis: optional map + table ----------
             with st.expander("View detailed route map and flagged steps"):
-                # use the nearest 3 depots only (from cached 'auto'; fallback recompute)
+                # nearest 3 only
                 depots3 = auto.get("nearest_depots") or nearest_depots(auto["lat"], auto["lon"], n=3)
                 depot_names = [d["name"] for d in depots3] if depots3 else []
             
-                # default to closest depot on first render, then persist user's choice
+                # default to closest and persist
                 if depot_names:
                     default_name = depot_names[0]
                     if "detail_depot" not in st.session_state:
                         st.session_state["detail_depot"] = default_name
             
-                    # Show only the closest three; changing this select triggers a re-run automatically
                     dep_choice = st.selectbox(
                         "Depot for detailed route",
                         depot_names,
@@ -1367,8 +1546,27 @@ if auto:
                     st.info("No nearby depots available.")
             
                 if dep_choice:
-                    # recalc (cached) whenever the dropdown changes
-                    detail = detailed_route_analysis(dep_choice, auto["lat"], auto["lon"], last_miles=20.0)
+                    veh_payload = {
+                        "height_m": veh_height_m,
+                        "width_m": veh_width_m,
+                        "turning_circle_m": turning_circle_m,
+                        "length_m": veh_length_m,
+                        # If you know typical gross vehicle weight for the preset, set it here; otherwise leave None
+                        "mass_t": None,
+                    }
+            
+                    detail = detailed_route_analysis(dep_choice, auto["lat"], auto["lon"], last_miles=20.0, vehicle=veh_payload)
+            
+                    # Overall verdict summary
+                    verdict = detail["summary"].get("overall", "PASS")
+                    blocks = detail["summary"].get("blockers", 0)
+                    atts = detail["summary"].get("attentions", 0)
+                    if verdict == "BLOCKER":
+                        st.error(f"Route verdict for {dep_choice}: BLOCKER — {blocks} blocker(s), {atts} attention item(s).")
+                    elif verdict == "ATTENTION":
+                        st.warning(f"Route verdict for {dep_choice}: ATTENTION — {atts} attention item(s).")
+                    else:
+                        st.success(f"Route verdict for {dep_choice}: PASS — no vehicle-specific conflicts detected in the last 20 miles.")
             
                     if detail["path"]:
                         path_layer = pdk.Layer(
@@ -1396,18 +1594,24 @@ if auto:
                             )
                         )
             
-                        if detail["steps"]:
-                            df = pd.DataFrame(detail["steps"]).drop(columns=["_lat", "_lon"])
-                            st.dataframe(df, use_container_width=True)
-                            st.download_button(
-                                "Download flagged steps (CSV)",
-                                data=df.to_csv(index=False).encode(),
-                                file_name=f"route_flags_{dep_choice}.csv",
-                                mime="text/csv"
-                            )
-                        else:
-                            st.info("No flagged steps detected in the last 20 miles.")
+                    # Conflicts table
+                    if detail["steps"]:
+                        df = pd.DataFrame(detail["steps"]).drop(columns=["_lat", "_lon"])
+                        # colour verdict column
+                        def _color_verdict(val):
+                            if val == "BLOCKER": return "background-color: #f8d7da"  # red-ish
+                            if val == "ATTENTION": return "background-color: #fff3cd"  # amber
+                            return ""
+                        st.dataframe(
+                            df.style.apply(lambda s: [_color_verdict(v) for v in s], subset=["Verdict"]),
+                            use_container_width=True
+                        )
+                        st.download_button(
+                            "Download vehicle-specific conflicts (CSV)",
+                            data=df.to_csv(index=False).encode(),
+                            file_name=f"route_conflicts_{dep_choice}.csv",
+                            mime="text/csv"
+                        )
                     else:
-                        st.warning("Could not fetch detailed route data for this depot.")
-            
-            
+                        st.info("No vehicle-specific conflicts detected in the analysed segment.")
+
