@@ -463,7 +463,8 @@ def _offline_ai_sections(ctx: Dict) -> Dict[str, str]:
 def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
     """
     Call OpenAI for commentary and robustly parse output into four sections.
-    Falls back to raising RuntimeError on API issues (caught by ai_sections()).
+    Safer parser: only treats headings at line-start as headings; inline headings
+    are only recognized if followed by ':' or a dash.
     """
     if not OPENAI_API_KEY:
         raise RuntimeError("No OpenAI key")
@@ -496,7 +497,6 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
         },
     }
 
-    # Stronger formatting instructions: each heading on its own line followed by one paragraph
     system = (
         "You are a safety and logistics assistant writing concise LPG site pre-check commentary. "
         "Audience is field engineers; keep it professional, UK terminology. "
@@ -538,60 +538,56 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
         raise RuntimeError(f"OpenAI error: {e}")
 
     # --- Robust parsing into 4 sections
-    sections = {
-        "Safety Risk Profile": "",
-        "Environmental Considerations": "",
-        "Access & Logistics": "",
-        "Overall Site Suitability": "",
-    }
-
     text = (content or "").replace("\r\n", "\n").strip()
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)  # drop bold markers
 
-    # Normalise common formats: remove bold markers and trailing colons after headings
-    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
-
-    heads = [
+    section_keys = [
         "Safety Risk Profile",
         "Environmental Considerations",
         "Access & Logistics",
         "Overall Site Suitability",
     ]
+    sections = {k: "" for k in section_keys}
 
-    # Regex that matches our headings at start-of-line with optional markdown hashes and optional colon
-    head_re = r"(?:^|\n)\s*(?:#+\s*)?(%s)\s*:?" % "|".join(map(re.escape, heads))
-    pattern = re.compile(head_re, re.IGNORECASE)
+    # Primary pass: headings MUST be at start of line (markdown ### / bold allowed, optional colon)
+    head_line_re = re.compile(
+        r"(?im)^\s*(?:#+\s*)?(?:\*\*)?(Safety Risk Profile|Environmental Considerations|Access & Logistics|Overall Site Suitability)(?:\*\*)?\s*:?\s*"
+    )
 
-    # If headings appear mid-line, insert a newline before them so the splitter works
-    def _newline_before_headings(t: str) -> str:
-        for h in heads:
-            t = re.sub(rf"(?<!\n)\s+({re.escape(h)})\s*:?", r"\n\1:", t, flags=re.IGNORECASE)
-        return t
+    def slice_by_matches(txt: str) -> Dict[str, str]:
+        found = {}
+        matches = list(head_line_re.finditer(txt))
+        if not matches:
+            return found
+        for idx, m in enumerate(matches):
+            key = m.group(1)
+            start = m.end()
+            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(txt)
+            body = txt[start:end].strip()
+            found[key] = body
+        return found
 
-    text = _newline_before_headings(text)
+    found = slice_by_matches(text)
 
-    # Split by headings and capture them
-    parts = pattern.split(text)
-    # parts looks like: [pre, H1, body1, H2, body2, H3, body3, H4, body4, post]
+    # Fallback pass: if fewer than 2 sections were found, try inline headings BUT
+    # ONLY when followed by ':' or a dash to avoid matching phrases like "safety risk profile is ..."
+    if sum(bool(v) for v in found.values()) < 2:
+        inline = text
+        for k in section_keys:
+            # insert newlines ONLY for tokens like "Heading:" or "Heading -"
+            inline = re.sub(
+                rf"(?i)(?<!\n)\s+({re.escape(k)})\s*[:\-–—]\s*",
+                r"\n\1: ",
+                inline,
+            )
+        found = slice_by_matches(inline)
 
-    if len(parts) >= 3:
-        # Walk pairs of (heading, body)
-        for i in range(1, len(parts), 2):
-            heading = (parts[i] or "").strip()
-            body = parts[i + 1] if i + 1 < len(parts) else ""
-            # Trim any further headings that might have leaked into this body
-            body = (pattern.split(body)[0] or "").strip()
-            # Normalise heading capitalisation to our keys
-            for k in sections.keys():
-                if heading.lower() == k.lower():
-                    sections[k] = body
-                    break
-    else:
-        # Fallback: if nothing matched, put everything in first section
-        sections["Safety Risk Profile"] = text
-
-    # Final tidy: ensure each section has some content
-    for k, v in list(sections.items()):
-        sections[k] = v.strip() or "No additional notes for this section."
+    # Load into final dict and tidy leading punctuation
+    for k in section_keys:
+        v = (found.get(k) or "").strip()
+        # remove any leading punctuation left behind if split mid-sentence by model formatting
+        v = v.lstrip(" .,:;–—-")
+        sections[k] = v or "No additional notes for this section."
 
     return sections
 
@@ -1163,3 +1159,4 @@ if auto:
                 )
             else:
                 st.caption("PDF generation unavailable on this host (ReportLab not installed).")
+
