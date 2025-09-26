@@ -1343,48 +1343,71 @@ if auto:
                 st.info("No notable flags detected within the last 20 miles (based on directions text). A manual review is still recommended.")
 
             # -------- Enhanced analysis: optional map + table ----------
+            # -------- Enhanced analysis: optional map + table ----------
             with st.expander("View detailed route map and flagged steps"):
-                dep_choice = st.selectbox("Depot for detailed route", [d[0] for d in DEPOTS], index=0)
-                detail = detailed_route_analysis(dep_choice, auto["lat"], auto["lon"], last_miles=20.0)
-
-                if detail["path"]:
-                    # interactive route map
-                    path_layer = pdk.Layer(
-                        "PathLayer",
-                        [{"path": detail["path"], "name": "Route"}],
-                        get_path="path",
-                        get_color=[0, 100, 200],
-                        width_scale=2,
-                        width_min_pixels=2,
+                # use the nearest 3 depots only (from cached 'auto'; fallback recompute)
+                depots3 = auto.get("nearest_depots") or nearest_depots(auto["lat"], auto["lon"], n=3)
+                depot_names = [d["name"] for d in depots3] if depots3 else []
+            
+                # default to closest depot on first render, then persist user's choice
+                if depot_names:
+                    default_name = depot_names[0]
+                    if "detail_depot" not in st.session_state:
+                        st.session_state["detail_depot"] = default_name
+            
+                    # Show only the closest three; changing this select triggers a re-run automatically
+                    dep_choice = st.selectbox(
+                        "Depot for detailed route",
+                        depot_names,
+                        index=depot_names.index(st.session_state["detail_depot"]),
+                        key="detail_depot",
                     )
-                    flag_layer = pdk.Layer(
-                        "ScatterplotLayer",
-                        detail["flags"],
-                        get_position=["lon", "lat"],
-                        get_fill_color=[200, 30, 30],
-                        get_radius=60,
-                        pickable=True,
-                    )
-                    view_state = pdk.ViewState(latitude=auto["lat"], longitude=auto["lon"], zoom=11)
-                    st.pydeck_chart(
-                        pdk.Deck(
-                            layers=[path_layer, flag_layer],
-                            initial_view_state=view_state,
-                            tooltip={"text": "{flags}\n{name}"}
-                        )
-                    )
-
-                    # flagged steps table + CSV
-                    if detail["steps"]:
-                        df = pd.DataFrame(detail["steps"]).drop(columns=["_lat", "_lon"])
-                        st.dataframe(df, use_container_width=True)
-                        st.download_button(
-                            "Download flagged steps (CSV)",
-                            data=df.to_csv(index=False).encode(),
-                            file_name="route_flags.csv",
-                            mime="text/csv"
-                        )
-                    else:
-                        st.info("No flagged steps detected in the last 20 miles.")
                 else:
-                    st.warning("Could not fetch detailed route data for this depot.")
+                    dep_choice = None
+                    st.info("No nearby depots available.")
+            
+                if dep_choice:
+                    # recalc (cached) whenever the dropdown changes
+                    detail = detailed_route_analysis(dep_choice, auto["lat"], auto["lon"], last_miles=20.0)
+            
+                    if detail["path"]:
+                        path_layer = pdk.Layer(
+                            "PathLayer",
+                            [{"path": detail["path"], "name": "Route"}],
+                            get_path="path",
+                            get_color=[0, 100, 200],
+                            width_scale=2,
+                            width_min_pixels=2,
+                        )
+                        flag_layer = pdk.Layer(
+                            "ScatterplotLayer",
+                            detail["flags"],
+                            get_position=["lon", "lat"],
+                            get_fill_color=[200, 30, 30],
+                            get_radius=60,
+                            pickable=True,
+                        )
+                        view_state = pdk.ViewState(latitude=auto["lat"], longitude=auto["lon"], zoom=11)
+                        st.pydeck_chart(
+                            pdk.Deck(
+                                layers=[path_layer, flag_layer],
+                                initial_view_state=view_state,
+                                tooltip={"text": "{flags}\n{name}"}
+                            )
+                        )
+            
+                        if detail["steps"]:
+                            df = pd.DataFrame(detail["steps"]).drop(columns=["_lat", "_lon"])
+                            st.dataframe(df, use_container_width=True)
+                            st.download_button(
+                                "Download flagged steps (CSV)",
+                                data=df.to_csv(index=False).encode(),
+                                file_name=f"route_flags_{dep_choice}.csv",
+                                mime="text/csv"
+                            )
+                        else:
+                            st.info("No flagged steps detected in the last 20 miles.")
+                    else:
+                        st.warning("Could not fetch detailed route data for this depot.")
+            
+            
