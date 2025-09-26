@@ -4,13 +4,16 @@ from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass
 
 import streamlit as st
-import pandas as pd
 from PIL import Image
 
 # ------------------------- Page config -------------------------
 PAGE_ICON = "icon.png" if os.path.exists("icon.png") else None
-COMPANY_LOGO = "companylogo.png"
-st.set_page_config(page_title="LPG Customer Tank — Pre-Check", page_icon=PAGE_ICON, layout="wide")
+COMPANY_LOGO = "companylogo.png"  # shown top-right after auth, if present
+st.set_page_config(
+    page_title="LPG Customer Tank — Pre-Check",
+    page_icon=PAGE_ICON,
+    layout="wide",
+)
 
 # ------------------------- Secrets -------------------------
 def get_secret(name: str, default: str = "") -> str:
@@ -20,12 +23,12 @@ def get_secret(name: str, default: str = "") -> str:
         return os.getenv(name, default)
 
 W3W_API_KEY    = get_secret("W3W_API_KEY")
-OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")  # used for online AI
 MAPBOX_TOKEN   = get_secret("MAPBOX_TOKEN")
-APP_PASSWORD   = get_secret("APP_PASSWORD", "")
-AI_MODEL       = get_secret("AI_MODEL", "gpt-4o-mini")
+APP_PASSWORD   = get_secret("APP_PASSWORD", "")  # <-- password lives with your API keys
+AI_MODEL       = get_secret("AI_MODEL", "gpt-4o-mini")  # optional override
 
-UA = {"User-Agent": "LPG-Precheck/2.0"}
+UA = {"User-Agent": "LPG-Precheck/1.9"}
 
 # ------------------------- Auth + status helpers -------------------------
 def is_authed() -> bool:
@@ -49,6 +52,7 @@ def sidebar_access():
     if not APP_PASSWORD:
         st.sidebar.warning("No APP_PASSWORD set — access is open.")
         return
+
     if st.session_state.get("__auth_ok__", False):
         st.sidebar.success("🔓 Access authenticated")
         return
@@ -59,9 +63,15 @@ def sidebar_access():
         if ok:
             st.session_state["__pw_input__"] = ""
 
-    st.sidebar.text_input("Password", type="password", key="__pw_input__", on_change=_try_unlock)
+    st.sidebar.text_input(
+        "Password",
+        type="password",
+        key="__pw_input__",
+        on_change=_try_unlock,
+    )
     if st.sidebar.button("Unlock", key="__unlock_btn__"):
         _try_unlock()
+
     if not st.session_state.get("__auth_ok__", False):
         st.sidebar.info("Enter the password to continue.")
 
@@ -87,7 +97,7 @@ def ll_to_xy(lat0, lon0, lat, lon):
     mlat, mlon = meters_per_degree(lat0)
     return (lon - lon0) * mlon, (lat - lat0) * mlat
 
-def _dist_m_local(lat0, lon0, lat1, lon1) -> float:
+def _dist_m(lat0, lon0, lat1, lon1) -> float:
     dx, dy = ll_to_xy(lat0, lon0, lat1, lon1)
     return math.hypot(dx, dy)
 
@@ -201,6 +211,7 @@ out tags geom;
         return {"elements": []}
 
 def nearest_hospital(lat: float, lon: float) -> Dict:
+    """Return nearest hospital-like feature up to 10 km."""
     radii = [400, 1000, 3000, 10000]
     best = None
     def centroid(coords):
@@ -237,9 +248,13 @@ out tags geom 20;
                 if not geom:
                     continue
                 la, lo = centroid([(g["lat"], g["lon"]) for g in geom])
-            d = _dist_m_local(lat, lon, la, lo)
+            d = _dist_m(lat, lon, la, lo)
             if best is None or d < best["distance_m"]:
-                best = {"name": name or "Nearest hospital","distance_m": round(d, 1),"lat": la, "lon": lo}
+                best = {
+                    "name": name or "Nearest hospital",
+                    "distance_m": round(d, 1),
+                    "lat": la, "lon": lo,
+                }
         if best:
             break
     return best or {"name": "n/a", "distance_m": None, "lat": None, "lon": None}
@@ -281,13 +296,13 @@ def parse_osm(lat0, lon0, data) -> Dict:
 
     drain_candidates = [dist_line(lat0, lon0, l) for l in drains]
     if manholes:
-        mh = min(_dist_m_local(lat0, lon0, la, lo) for la,lo in manholes)
+        mh = min(_dist_m(lat0, lon0, la, lo) for la,lo in manholes)
         drain_candidates.append(mh)
     d_drain = _min_clean(drain_candidates)
 
     over_candidates = [dist_line(lat0, lon0, l) for l in plines]
     if pnodes:
-        pn = min(_dist_m_local(lat0, lon0, la, lo) for la,lo in pnodes)
+        pn = min(_dist_m(lat0, lon0, la, lo) for la,lo in pnodes)
         over_candidates.append(pn)
     d_over = _min_clean(over_candidates)
 
@@ -319,6 +334,184 @@ def parse_osm(lat0, lon0, data) -> Dict:
         "water_m":    round(d_water,1) if d_water is not None else None,
         "land_class": land_class,
     }
+
+# ------------------------- Depots -------------------------
+DEPOTS = [
+    ("Blaydon", -1.744101, 54.9756187),
+    ("Buckfastleigh", -3.7833235, 50.4869034),
+    ("Burton", -1.559383, 52.7768106),
+    ("Cairnhill", -2.556494, 57.3820238),
+    ("Carlisle", -2.950747, 54.898308),
+    ("Conwy", -3.8574551, 53.2876319),
+    ("Defford", -2.161253, 52.0883951),
+    ("Evanton", -4.3069473, 57.6723499),
+    ("Fawley", -1.3778735, 50.8490674),
+    ("Grangemouth", -3.7212715, 56.0224567),
+    ("Knowsley", -2.8682086, 53.4630737),
+    ("Launceston", -4.3922685, 50.6278182),
+    ("Leeds", -1.5059716, 53.7829647),
+    ("Llandarcy", -3.8451237, 51.6391619),
+    ("Ludham", 1.5499137, 52.7241592),
+    ("Newport", -2.9782096, 51.5675306),
+    ("Paisley", -4.424505, 55.8532784),
+    ("Perth", -3.4755149, 56.4169938),
+    ("Peterborough", -0.2142451, 52.5776289),
+    ("Presteigne", -2.9945084, 52.2688513),
+    ("Rainham", 0.1698276, 51.509824),
+    ("Sittingbourne", 0.7530866, 51.3850881),
+    ("Skegness", 0.2666851, 53.2554345),
+    ("Staveley", -1.355699, 53.2761913),
+    ("Stoke", -2.1676655, 52.9648079),
+    ("Swinton", -2.2697802, 55.7230767),
+    ("Witney", -1.5068047, 51.7926625),
+    ("Wrexham", -2.9252352, 53.0264358),
+]
+
+def nearest_depots(lat: float, lon: float, n: int = 3):
+    rows = []
+    for name, dlon, dlat in DEPOTS:
+        m = _dist_m(lat, lon, dlat, dlon)
+        rows.append({"name": name, "miles": m / 1609.344})
+    rows.sort(key=lambda r: r["miles"])
+    return rows[:n]
+
+# ------------------------- Routing (OSRM) + quick analysis -------------------------
+def _bearing_deg(a: Tuple[float,float], b: Tuple[float,float]) -> float:
+    lat1, lon1 = map(math.radians, a)
+    lat2, lon2 = map(math.radians, b)
+    dlon = lon2 - lon1
+    x = math.sin(dlon) * math.cos(lat2)
+    y = math.cos(lat1)*math.sin(lat2) - math.sin(lat1)*math.cos(lat2)*math.cos(dlon)
+    brng = (math.degrees(math.atan2(x, y)) + 360) % 360
+    return brng
+
+def _compass_from_deg(deg: float) -> str:
+    return ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"][round((deg%360)/22.5)%16]
+
+def osrm_route(lat1, lon1, lat2, lon2, overview=True, steps=True) -> Dict:
+    try:
+        url = f"https://router.project-osrm.org/route/v1/driving/{lon1},{lat1};{lon2},{lat2}"
+        params = {
+            "alternatives": "false",
+            "overview": "full" if overview else "false",
+            "steps": "true" if steps else "false",
+            "geometries": "geojson",
+            "annotations": "false",
+        }
+        r = requests.get(url, params=params, headers=UA, timeout=20)
+        r.raise_for_status()
+        j = r.json()
+        if j.get("routes"):
+            return j["routes"][0]
+    except Exception:
+        pass
+    return {}
+
+def quick_route_snapshot(dep: Dict, site_lat: float, site_lon: float) -> Dict:
+    """Return quick driving distance/ETA + approach info + lightweight flags."""
+    out = {
+        "miles": None,
+        "eta_min": None,
+        "final_road": None,
+        "approach_deg": None,
+        "approach_compass": None,
+        "winding": None,     # Low/Medium/High
+        "counts": {},        # parsed lightweight flags by keyword
+        "full_miles": None,  # entire route length miles
+    }
+    if not dep:
+        return out
+
+    route = osrm_route(dep["lat"], dep["lon"], site_lat, site_lon)
+    if not route:
+        return out
+
+    total_m = route.get("distance") or 0.0
+    total_s = route.get("duration") or 0.0
+    out["full_miles"] = round(total_m / 1609.344, 1)
+
+    miles = round(total_m / 1609.344, 1)
+    eta_min = round(total_s / 60.0)
+    out["miles"] = miles
+    out["eta_min"] = eta_min
+
+    # Steps parsing
+    steps = []
+    legs = route.get("legs") or []
+    if legs:
+        for leg in legs:
+            for stp in leg.get("steps", []):
+                steps.append(stp)
+
+    # Final approach
+    if steps:
+        last = steps[-1]
+        out["final_road"] = (last.get("name") or "").strip() or None
+
+    # Approach bearing from last 2 coords
+    coords = route.get("geometry", {}).get("coordinates") or []
+    if len(coords) >= 2:
+        # OSRM coords are [lon, lat]
+        a = (coords[-2][1], coords[-2][0])
+        b = (coords[-1][1], coords[-1][0])
+        br = _bearing_deg(a, b)
+        out["approach_deg"] = round(br)
+        out["approach_compass"] = _compass_from_deg(br)
+
+    # Last-mile winding score
+    # Walk back until ~1 mile and sum absolute heading changes
+    if len(coords) >= 3:
+        total = 0.0
+        changes = 0.0
+        last_bear = None
+        for i in range(len(coords)-1, 0, -1):
+            latb, lonb = coords[i][1], coords[i][0]
+            lata, lona = coords[i-1][1], coords[i-1][0]
+            seg = _dist_m(latb, lonb, lata, lona)
+            total += seg
+            bear = _bearing_deg((lata,lona), (latb,lonb))
+            if last_bear is not None:
+                d = abs((bear - last_bear + 180) % 360 - 180)
+                changes += d
+            last_bear = bear
+            if total >= 1609.344:  # ~1 mile
+                break
+        if changes < 120:
+            out["winding"] = "Low"
+        elif changes < 240:
+            out["winding"] = "Medium"
+        else:
+            out["winding"] = "High"
+
+    # Lightweight flags via step text/name scanning
+    keywords = {
+        "barrier_gate": r"\b(gate|barrier)\b",
+        "bollard": r"\b(bollard|bollards)\b",
+        "tunnel": r"\b(tunnel|underpass)\b",
+        "ford": r"\b(ford)\b",
+        "narrow": r"\b(narrow)\b",
+        "weight": r"\b(weight|tonnage)\b",
+        "height": r"\b(height|low\s+bridge|clearance)\b",
+        "width": r"\b(width)\b",
+        "private": r"\b(private\s+road|no\s+through)\b",
+        "construction": r"\b(construction|roadworks|closure|closed)\b",
+        "rail": r"\b(level\s+crossing|rail)\b",
+    }
+    counts = {k: 0 for k in keywords}
+    try:
+        for stp in steps:
+            txt = " ".join([
+                str(stp.get("name") or ""),
+                str(stp.get("ref") or ""),
+                str(stp.get("maneuver", {}).get("instruction") or "")
+            ]).lower()
+            for k, rx in keywords.items():
+                if re.search(rx, txt):
+                    counts[k] += 1
+    except Exception:
+        pass
+    out["counts"] = counts
+    return out
 
 # ------------------------- Risk scoring -------------------------
 CoP = {
@@ -417,6 +610,7 @@ def _offline_ai_sections(ctx: Dict) -> Dict[str, str]:
     los = ctx["los_issue"]
     veg = ctx["veg_3m"]
     land = feats.get("land_class", "n/a")
+    route = ctx.get("route", {}) or {}
 
     s1 = (
         f"The local slope is {slope_pct:.1f}%. Key separations (m): "
@@ -426,18 +620,24 @@ def _offline_ai_sections(ctx: Dict) -> Dict[str, str]:
         f"Heuristic {risk.score:.1f}/100 → {risk.status}. Drivers: "
         + "; ".join([f"{p} {m}" for p, m in risk.explain[:5]]) + "."
     )
+    counts = route.get("counts") or {}
+    issues_line = "No route flags detected." if not counts or sum(counts.values()) == 0 else (
+        "Route flags — " + ", ".join([f"{k.replace('_',' ')}: {v}" for k, v in counts.items() if v])
+    )
     s2 = (
         f"Flood Low (No mapped watercourse nearby). Watercourse ~{feats.get('water_m','n/a')} m; "
-        f"drains/manholes {feats.get('drain_m','n/a')} m. Land use {land}. Vegetation within 3 m: level {veg}."
+        f"drains/manholes {feats.get('drain_m','n/a')} m. Land use {land}. Vegetation within 3 m: level {veg}. "
+        f"{issues_line}"
     )
     s3 = (
-        f"Access lines of sight: {'restricted' if los else 'clear'}; "
-        f"enclosure effect {sides} solid side(s). Validate signage/restrictions; "
-        f"provide sound hardstanding and clear sightlines."
+        f"Access lines of sight: {'restricted' if los else 'clear'}; enclosure {sides} side(s). "
+        f"Nearest depot drive ~{route.get('miles','n/a')} mi, ETA {route.get('eta_min','n/a')} min. "
+        f"Final approach via {route.get('final_road') or 'n/a'} from {route.get('approach_compass') or 'n/a'} "
+        f"({route.get('approach_deg') or 'n/a'}°). Last-mile winding: {route.get('winding') or 'n/a'}."
     )
     s4 = (
         "Attention required — ensure separation compliance, ignition control, drainage protection, "
-        "and safe approach/egress."
+        "and safe approach/egress. Confirm route restrictions before mobilisation."
     )
     return {
         "Safety Risk Profile": s1,
@@ -447,12 +647,17 @@ def _offline_ai_sections(ctx: Dict) -> Dict[str, str]:
     }
 
 def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
+    """
+    Online AI that now also considers route snapshot/counts.
+    """
     if not OPENAI_API_KEY:
         raise RuntimeError("No OpenAI key")
+
     model = model or AI_MODEL
     feats = ctx.get("feats", {})
     wind = ctx.get("wind", {})
     risk = ctx.get("risk")
+    route = ctx.get("route", {}) or {}
 
     site = {
         "wind": {"mps": wind.get("speed_mps"), "dir_deg": wind.get("deg"), "dir_compass": wind.get("compass")},
@@ -475,24 +680,49 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
             "status": getattr(risk, "status", None),
             "drivers": getattr(risk, "explain", []),
         },
+        "route": {
+            "driving_miles": route.get("miles"),
+            "eta_min": route.get("eta_min"),
+            "final_road": route.get("final_road"),
+            "approach_deg": route.get("approach_deg"),
+            "approach_compass": route.get("approach_compass"),
+            "winding": route.get("winding"),
+            "counts": route.get("counts"),
+        }
     }
+
     system = (
         "You are a safety and logistics assistant writing concise LPG site pre-check commentary. "
         "Audience is field engineers; keep it professional, UK terminology. "
-        "Output exactly four sections with these headings, each on its own line followed by one paragraph: "
-        "Safety Risk Profile; Environmental Considerations; Access & Logistics; Overall Site Suitability."
+        "Use the route snapshot (miles/ETA/approach/winding and counts) to tailor the Access & Logistics section. "
+        "Output exactly four sections with these exact headings, each as a single short paragraph:\n"
+        "### Safety Risk Profile\n"
+        "### Environmental Considerations\n"
+        "### Access & Logistics\n"
+        "### Overall Site Suitability"
     )
     user = (
         "Using this site context, write those four sections (short, specific, actionable). "
-        "Avoid repeating all numbers verbatim unless helpful; focus on implications. "
+        "Avoid repeating every number; focus on implications and what to do. "
         f"Context:\n{json.dumps(site, ensure_ascii=False)}"
     )
+
     try:
         r = requests.post(
             "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}","Content-Type": "application/json"},
-            json={"model": model,"messages":[{"role":"system","content":system},{"role":"user","content":user}],
-                  "temperature":0.3,"max_tokens":450},
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 450,
+            },
             timeout=30,
         )
         r.raise_for_status()
@@ -500,8 +730,9 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
     except Exception as e:
         raise RuntimeError(f"OpenAI error: {e}")
 
+    # --- Robust parsing into 4 sections (same hardened parser)
     text = (content or "").replace("\r\n", "\n").strip()
-    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)  # drop bold markers
 
     section_keys = [
         "Safety Risk Profile",
@@ -529,20 +760,25 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
         return found
 
     found = slice_by_matches(text)
-
     if sum(bool(v) for v in found.values()) < 2:
         inline = text
         for k in section_keys:
-            inline = re.sub(rf"(?i)(?<!\n)\s+({re.escape(k)})\s*[:\-–—]\s*", r"\n\1: ", inline)
+            inline = re.sub(
+                rf"(?i)(?<!\n)\s+({re.escape(k)})\s*[:\-–—]\s*",
+                r"\n\1: ",
+                inline,
+            )
         found = slice_by_matches(inline)
 
     for k in section_keys:
         v = (found.get(k) or "").strip()
         v = v.lstrip(" .,:;–—-")
         sections[k] = v or "No additional notes for this section."
+
     return sections
 
 def ai_sections(ctx: Dict) -> Dict[str, str]:
+    """Try online; fallback to offline if key missing or error."""
     if OPENAI_API_KEY:
         try:
             return _online_ai_sections(ctx)
@@ -550,8 +786,14 @@ def ai_sections(ctx: Dict) -> Dict[str, str]:
             pass
     return _offline_ai_sections(ctx)
 
-# ------------------------- UI helper: Not-mapped distance -------------------------
-def nm_distance(label: str, key: str, auto_val: Optional[float], max_val: float = 2000.0, seed_tag: Optional[str] = None) -> Optional[float]:
+# ------------------------- UI helper: seeded, editable distance -------------------------
+def nm_distance(
+    label: str,
+    key: str,
+    auto_val: Optional[float],
+    max_val: float = 2000.0,
+    seed_tag: Optional[str] = None,
+) -> Optional[float]:
     tag = seed_tag or "__default__"
     if st.session_state.get(f"{key}__seed") != tag:
         st.session_state[f"{key}__nm"]  = (auto_val is None)
@@ -560,7 +802,12 @@ def nm_distance(label: str, key: str, auto_val: Optional[float], max_val: float 
 
     c1, c2 = st.columns([0.78, 0.22])
     with c1:
-        val = st.number_input(label, min_value=0.0, max_value=float(max_val), step=0.1, value=float(st.session_state[f"{key}__val"]), key=f"{key}__val_input")
+        val = st.number_input(
+            label,
+            min_value=0.0, max_value=float(max_val), step=0.1,
+            value=float(st.session_state[f"{key}__val"]),
+            key=f"{key}__val_input",
+        )
     with c2:
         nm = st.checkbox("Not mapped", value=st.session_state[f"{key}__nm"], key=f"{key}__nm_chk")
 
@@ -570,6 +817,7 @@ def nm_distance(label: str, key: str, auto_val: Optional[float], max_val: float 
 
 # ------------------------- Pretty key/value block -------------------------
 def kv_block(title: str, data: Dict, cols: int = 2, fmt: Dict[str, str] | None = None):
+    """Pretty key/value block (inline compact)."""
     st.markdown(f"### {title}" if title.lower().startswith("key") else f"#### {title}")
     keys = list(data.keys())
     rows = (len(keys) + cols - 1) // cols
@@ -588,98 +836,31 @@ def kv_block(title: str, data: Dict, cols: int = 2, fmt: Dict[str, str] | None =
         for c in range(cols):
             i = r + c*rows
             if i < len(keys):
-                k = keys[i]; v = data[k]
+                k = keys[i]
+                v = data[k]
                 with cs[c]:
-                    st.markdown(f"<div style='line-height:1.4'><b>{k}:</b> {show(k,v)}</div>", unsafe_allow_html=True)
+                    st.markdown(
+                        f"<div style='line-height:1.4'><b>{k}:</b> {show(k,v)}</div>",
+                        unsafe_allow_html=True,
+                    )
 
-# ------------------------- Depots & OSRM quick route -------------------------
-DEPOTS = [
-    {"name": "Blaydon", "lat": 54.9756187, "lon": -1.744101},
-    {"name": "Buckfastleigh", "lat": 50.4869034, "lon": -3.7833235},
-    {"name": "Burton", "lat": 52.7768106, "lon": -1.559383},
-    {"name": "Cairnhill", "lat": 57.3820238, "lon": -2.556494},
-    {"name": "Carlisle", "lat": 54.898308, "lon": -2.950747},
-    {"name": "Conwy", "lat": 53.2876319, "lon": -3.8574551},
-    {"name": "Defford", "lat": 52.0883951, "lon": -2.161253},
-    {"name": "Evanton", "lat": 57.6723499, "lon": -4.3069473},
-    {"name": "Fawley", "lat": 50.8490674, "lon": -1.3778735},
-    {"name": "Grangemouth", "lat": 56.0224567, "lon": -3.7212715},
-    {"name": "Knowsley", "lat": 53.4630737, "lon": -2.8682086},
-    {"name": "Launceston", "lat": 50.6278182, "lon": -4.3922685},
-    {"name": "Leeds", "lat": 53.7829647, "lon": -1.5059716},
-    {"name": "Llandarcy", "lat": 51.6391619, "lon": -3.8451237},
-    {"name": "Ludham", "lat": 52.7241592, "lon": 1.5499137},
-    {"name": "Newport", "lat": 51.5675306, "lon": -2.9782096},
-    {"name": "Paisley", "lat": 55.8532784, "lon": -4.424505},
-    {"name": "Perth", "lat": 56.4169938, "lon": -3.4755149},
-    {"name": "Peterborough", "lat": 52.5776289, "lon": -0.2142451},
-    {"name": "Presteigne", "lat": 52.2688513, "lon": -2.9945084},
-    {"name": "Rainham", "lat": 51.509824, "lon": 0.1698276},
-    {"name": "Sittingbourne", "lat": 51.3850881, "lon": 0.7530866},
-    {"name": "Skegness", "lat": 53.2554345, "lon": 0.2666851},
-    {"name": "Staveley", "lat": 53.2761913, "lon": -1.355699},
-    {"name": "Stoke", "lat": 52.9648079, "lon": -2.1676655},
-    {"name": "Swinton", "lat": 55.7230767, "lon": -2.2697802},
-    {"name": "Witney", "lat": 51.7926625, "lon": -1.5068047},
-    {"name": "Wrexham", "lat": 53.0264358, "lon": -2.9252352},
-]
+def winding_badge(level: Optional[str]) -> str:
+    color = {
+        "Low": "#289e41",
+        "Medium": "#e0a10b",
+        "High": "#cc2b2b"
+    }.get(level or "", "#7a7a7a")
+    label = level or "n/a"
+    return f"<span style='background:{color};color:white;padding:2px 8px;border-radius:999px;font-weight:600'>{label}</span>"
 
-def nearest_depots(lat, lon, n=3):
-    out = []
-    for d in DEPOTS:
-        dist_m = _dist_m_local(lat, lon, d["lat"], d["lon"])
-        out.append({"name": d["name"], "miles": dist_m/1609.344, "lat": d["lat"], "lon": d["lon"]})
-    out.sort(key=lambda x: x["miles"])
-    return out[:n]
-
-from math import radians, sin, cos, asin, sqrt, atan2, degrees
-
-def bearing_deg(lat1, lon1, lat2, lon2) -> float:
-    y = math.sin(math.radians(lon2-lon1)) * math.cos(math.radians(lat2))
-    x = math.cos(math.radians(lat1))*math.sin(math.radians(lat2)) - math.sin(math.radians(lat1))*math.cos(math.radians(lat2))*math.cos(math.radians(lon2-lon1))
-    return (math.degrees(math.atan2(y, x)) + 360) % 360
-
-def compass_dir(b: float) -> str:
-    dirs = ["N","NE","E","SE","S","SW","W","NW"]
-    return dirs[round(b/45) % 8]
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def osrm_quick(start_lat, start_lon, end_lat, end_lon):
-    url = f"https://router.project-osrm.org/route/v1/driving/{start_lon},{start_lat};{end_lon},{end_lat}"
-    try:
-        r = requests.get(url, params={"overview":"full","geometries":"geojson","steps":"true"}, timeout=15)
-        r.raise_for_status()
-        js = r.json()
-        if not js.get("routes"): return None
-        return js["routes"][0]
-    except Exception:
-        return None
-
-def quick_winding(route):
-    coords = (route.get("geometry") or {}).get("coordinates") if route else []
-    if not coords: return "Unknown"
-    # last ~1 mile
-    acc = 0.0; dirs=[]
-    for i in range(len(coords)-1, 0, -1):
-        lat1, lon1 = coords[i][1], coords[i][0]
-        lat0, lon0 = coords[i-1][1], coords[i-1][0]
-        d = _dist_m_local(lat0, lon0, lat1, lon1)
-        acc += d
-        dirs.append(bearing_deg(lat0, lon0, lat1, lon1))
-        if acc > 1609: break
-    if len(dirs) < 2: return "Low"
-    diffs = sum(abs(dirs[i]-dirs[i-1]) for i in range(1,len(dirs)))
-    if diffs < 90: return "Low"
-    if diffs < 180: return "Medium"
-    return "High"
-
-# ------------------------- Sidebar -------------------------
+# ------------------------- Sidebar (status & access) -------------------------
 sidebar_secrets_status()
 sidebar_access()
 if not is_authed():
     st.stop()
 
-# ------------------------- App header -------------------------
+# ------------------------- App -------------------------
+# Title + right-aligned company logo (shown only after auth)
 if PAGE_ICON:
     header_cols = st.columns([0.08, 0.72, 0.20])
     with header_cols[0]:
@@ -699,14 +880,20 @@ else:
 
 st.caption("Enter a what3words location, review/edit auto-filled data, then confirm to assess.")
 
-# ------------------------- W3W input + buttons -------------------------
-w3w_input = st.text_input("what3words (word.word.word):", value=st.session_state.get("w3w", ""), key="w3w_entry")
+# ------------------------- W3W input THEN buttons -------------------------
+w3w_input = st.text_input(
+    "what3words (word.word.word):",
+    value=st.session_state.get("w3w", ""),
+    key="w3w_entry",
+)
+
 c_run, c_reset, _ = st.columns([0.18, 0.14, 0.68])
 with c_run:
     run = st.button("Run Pre-Check", type="primary", use_container_width=True, key="run_btn")
 with c_reset:
     reset = st.button("Reset", type="secondary", use_container_width=True, key="reset_btn")
 
+# Reset: clear data below and W3W, hide edit/results until new W3W entered
 if reset:
     for k in list(st.session_state.keys()):
         if k.startswith("d_") or k.endswith("__val") or k.endswith("__nm") or k.endswith("__seed") or k.startswith("veh_"):
@@ -728,20 +915,37 @@ if run:
             if lat is None:
                 st.error("what3words lookup failed.")
                 st.stop()
+
             addr = reverse_geocode(lat, lon)
             wind = open_meteo(lat, lon)
             osm  = overpass_near(lat, lon, radius=400)
             feats = parse_osm(lat, lon, osm)
             hosp = nearest_hospital(lat, lon)
+
+            # nearest depot set
+            dep3 = nearest_depots(lat, lon, n=3)
+            dep_sel = dep3[0] if dep3 else None
+            dep_sel_full = {"name": dep_sel["name"], "lat": next(d[2] for d in DEPOTS if d[0]==dep_sel["name"]),
+                            "lon": next(d[1] for d in DEPOTS if d[0]==dep_sel["name"])} if dep_sel else None
+
+            # quick route snapshot
+            route_snap = {}
+            if dep_sel_full:
+                route_snap = quick_route_snapshot(dep_sel_full, lat, lon)
+
             st.session_state["auto"] = {
                 "lat": lat, "lon": lon,
-                "addr": addr, "hospital": hosp,
+                "addr": addr,
+                "hospital": hosp,
                 "wind_mps": wind.get("speed_mps") or 0.0,
                 "wind_deg": wind.get("deg") or 0,
                 "wind_comp": wind.get("compass") or "n/a",
                 "slope_pct": 3.5,
-                "approach_avg": 0.9, "approach_max": 3.5,
+                "approach_avg": 0.9,
+                "approach_max": 3.5,
                 **feats,
+                "nearest_depots": dep3,
+                "route_snap": route_snap,
             }
             st.success("Auto data ready.")
 
@@ -753,7 +957,7 @@ if auto:
 
     st.markdown("### Edit & confirm")
     with st.form("inputs"):
-        # -------- Location & address --------
+        # ---------------- Location & address (FIRST) ----------------
         st.subheader("Location & address")
         a1, a2 = st.columns([0.6, 0.4])
         with a1:
@@ -771,7 +975,7 @@ if auto:
             st.text_input("Hospital distance (approx.)", hosp_km, disabled=True, key="hosp_dist_ro")
         st.markdown("---")
 
-        # -------- Environment & approach --------
+        # ---------------- Environment & approach ----------------
         st.subheader("Environment & approach")
         e1, e2, e3 = st.columns(3)
         with e1:
@@ -844,62 +1048,73 @@ if auto:
         st.session_state[f"{basekey}_height_m"] = veh_height_m
         st.session_state[f"{basekey}_turning_circle_m"] = turning_circle_m
 
-        # -------- Nearest depot & quick snapshot --------
+        # ---------------- Nearest Depot & Logistics ----------------
         st.markdown("---")
-        st.subheader("Nearest Depot & Logistics  ↔")
-        depots3 = nearest_depots(auto["lat"], auto["lon"], n=3)
-        leftd, rightd = st.columns([0.55, 0.45])
-        with leftd:
-            st.text_input("Nearest depot", depots3[0]["name"], disabled=True)
-        with rightd:
-            st.text_input("Distance (miles)", f"{depots3[0]['miles']:.1f} miles", disabled=True)
+        st.subheader("Nearest Depot & Logistics ↪")
+
+        ndc1, ndc2 = st.columns([0.6, 0.4])
+        depots3 = auto.get("nearest_depots") or nearest_depots(auto["lat"], auto["lon"], n=3)
+        with ndc1:
+            st.text_input("Nearest depot", depots3[0]["name"] if depots3 else "—", disabled=True)
+        with ndc2:
+            st.text_input("Distance (miles)", f"{depots3[0]['miles']:.1f} miles" if depots3 else "—", disabled=True)
 
         st.caption("Top 3 nearest depots (crow-fly)")
-        df = pd.DataFrame([{"Depot": d["name"], "Distance (miles)": f"{d['miles']:.1f}"} for d in depots3])
-        df.index = range(1, len(df)+1); df.index.name = ""
-        st.table(df)
+        st.table({
+            "Depot": [d["name"] for d in depots3],
+            "Distance (miles)": [f"{d['miles']:.1f}" for d in depots3],
+        })
 
-        st.caption("Quick route snapshot (nearest depot)")
-        route_quick = osrm_quick(depots3[0]["lat"], depots3[0]["lon"], auto["lat"], auto["lon"])
-        colA, colB, colC = st.columns(3)
-        if route_quick:
-            dist_mi = route_quick["distance"]/1609.344
-            eta_min = route_quick["duration"]/60
-            with colA:
-                st.metric("Driving distance", f"{dist_mi:.1f} mi")
-            with colB:
-                st.metric("ETA (typical)", f"{eta_min:.0f} min")
-            with colC:
-                st.metric("Last-mile winding", quick_winding(route_quick))
+        # quick route snapshot
+        st.markdown("**Quick route snapshot (nearest depot)**")
+        rs = auto.get("route_snap") or {}
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown("**Driving distance**")
+            st.markdown(f"🛣️  <span style='font-size:28px;font-weight:700'>{rs.get('miles','n/a')} mi</span>", unsafe_allow_html=True)
+        with c2:
+            st.markdown("**ETA (typical)**")
+            st.markdown(f"⏱️  <span style='font-size:28px;font-weight:700'>{rs.get('eta_min','n/a')} min</span>", unsafe_allow_html=True)
+        with c3:
+            st.markdown("**Last-mile winding**")
+            st.markdown("🌀 " + winding_badge(rs.get("winding")), unsafe_allow_html=True)
 
-            steps = route_quick.get("legs",[{}])[0].get("steps",[])
-            if steps:
-                laststep = steps[-1]
-                road = laststep.get("name","?")
-                coords = route_quick["geometry"]["coordinates"]
-                if len(coords)>=2:
-                    b = bearing_deg(coords[-2][1], coords[-2][0], coords[-1][1], coords[-1][0])
-                    st.write(f"• Final approach via **{road}**; approach from **{compass_dir(b)} ({b:.0f}°)**.")
-            if any(("tunnel" in (s.get("name","").lower()) or "tunnel" in (s.get("ref","") or "").lower()) for s in steps):
-                st.warning("⚠️ Possible tunnel/underpass in directions — LPG tankers not permitted in tunnels. Full check appears after Confirm & assess.")
+        # Approach text line
+        appr = []
+        if rs.get("final_road"): appr.append(f"Final approach via **{rs['final_road']}**")
+        if rs.get("approach_compass") is not None and rs.get("approach_deg") is not None:
+            appr.append(f"approach from **{rs['approach_compass']} ({rs['approach_deg']}°)**")
+        if appr:
+            st.markdown("• " + "; ".join(appr) + ".")
 
-        # -------- Site options (restored) --------
         st.markdown("---")
         st.subheader("Site options")
         v1, v2 = st.columns([0.5, 0.5])
         with v1:
-            veg_3m = st.slider("Vegetation within 3 m of tank (0 none → 3 heavy)", 0, 3, st.session_state.get("veg_3m", 1), key="veg_slider")
-            enclosure_sides = st.select_slider("Number of solid sides enclosing tank/stand (fence/walls)", options=[0,1,2,3,4], value=st.session_state.get("enclosure_sides", 0), key="enclosure_sides_sel")
-            los_issue = st.toggle("Restricted line-of-sight at Delivery Point", value=st.session_state.get("los_issue", False), key="los_tgl")
+            veg_3m = st.slider("Vegetation within 3 m of tank (0 none → 3 heavy)", 0, 3, 1, key="veg_slider")
+            enclosure_sides = st.select_slider(
+                "Number of solid sides enclosing tank/stand (fence/walls)",
+                options=[0, 1, 2, 3, 4], value=0, key="enclosure_sides_sel"
+            )
+            los_issue = st.toggle(
+                "Restricted line-of-sight at Delivery Point",
+                value=False,
+                key="los_tgl"
+            )
+
         with v2:
-            stand_surface = st.selectbox("Stand surface", ["asphalt","concrete","block paving","gravel","grass","other"], index=["asphalt","concrete","block paving","gravel","grass","other"].index(st.session_state.get("stand_surface_sel","asphalt")), key="stand_surface_sel")
+            stand_surface = st.selectbox(
+                "Stand surface",
+                ["asphalt", "concrete", "block paving", "gravel", "grass", "other"],
+                index=0,
+                key="stand_surface_sel"
+            )
             open_field_m = nm_distance("Distance to open field (m)", "d_open_field_m", None, seed_tag=seed)
 
-        notes_txt = st.text_input("Notes (vegetation / sightlines / special instructions)", value=st.session_state.get("notes_input",""), key="notes_input")
+        notes_txt = st.text_input("Notes (vegetation / sightlines / special instructions)", value="", key="notes_input")
 
         submitted = st.form_submit_button("Confirm & assess", type="primary", key="confirm_btn")
 
-    # --------------- Post-submit: analysis + AI + PDF ---------------
     if submitted:
         feats = {
             "building_m": building_m, "road_m": road_m, "drain_m": drain_m,
@@ -971,7 +1186,9 @@ if auto:
             )
 
             st.markdown("### Risk result")
-            badge = ("✅ PASS" if risk.status=="PASS" else "🟡 ATTENTION" if risk.status=="ATTENTION" else "🟥 BLOCKER")
+            badge = ("✅ PASS" if risk.status=="PASS"
+                     else "🟡 ATTENTION" if risk.status=="ATTENTION"
+                     else "🟥 BLOCKER")
             st.subheader(f"{risk.score:.1f}/100  {badge}")
             st.markdown("#### Top contributing factors")
             for p, m in risk.explain[:6]:
@@ -988,7 +1205,8 @@ if auto:
             ctx = {
                 "feats": feats, "wind": wind, "slope_pct": slope_pct,
                 "enclosure_sides": enclosure_sides, "los_issue": los_issue,
-                "veg_3m": veg_3m, "risk": risk
+                "veg_3m": veg_3m, "risk": risk,
+                "route": (auto.get("route_snap") or {}),
             }
             ai = ai_sections(ctx)
             sections = [
@@ -1011,6 +1229,9 @@ if auto:
                 controls_list.append("Ensure firm, level stand surface (temporary mats if required).")
             if overhead_m is not None and overhead_m < CoP["overhead_info_m"]:
                 controls_list.append("Confirm isolation/clearance for overhead power; position tanker outside bands.")
+            # Light tunnel hint based on quick analysis:
+            if (auto.get("route_snap", {}).get("counts", {}).get("tunnel", 0) or 0) > 0:
+                controls_list.append("⚠️ LPG tankers: tunnels/underpasses noted on approach — plan a compliant diversion.")
             for b in controls_list:
                 st.write("• " + b)
 
@@ -1021,65 +1242,47 @@ if auto:
             else:
                 st.info("ATTENTION — check turning area / bearing capacity for the selected vehicle.")
 
-            # ---------- Detailed route analysis (final 20 miles) ----------
-            st.markdown("### Route analysis (last 20 miles)")
-            depots3 = nearest_depots(auto["lat"], auto["lon"], n=3)
-            route_full = osrm_quick(depots3[0]["lat"], depots3[0]["lon"], auto["lat"], auto["lon"])
-            if route_full:
-                full_miles = route_full["distance"]/1609.344
-                full_min   = route_full["duration"]/60
-                steps = route_full.get("legs",[{}])[0].get("steps",[])
-                # Build a thin issues table
-                issues = []
-                dist_from_end = 0.0
-                coords = (route_full.get("geometry") or {}).get("coordinates", [])
-                # Reverse accumulate distance to end
-                seg_dists = [0.0]
-                for i in range(len(coords)-1):
-                    lat0, lon0 = coords[i][1], coords[i][0]
-                    lat1, lon1 = coords[i+1][1], coords[i+1][0]
-                    seg_dists.append(_dist_m_local(lat0, lon0, lat1, lon1))
-                cum_to_end = [0.0]*len(coords)
-                total = 0.0
-                for i in range(len(coords)-1,0,-1):
-                    total += seg_dists[i]
-                    cum_to_end[i-1] = total
-                # Scan steps for hints
-                for s in steps:
-                    name = s.get("name") or s.get("ref") or ""
-                    inst = s.get("mode","") + " " + (s.get("maneuver",{}).get("type","") or "")
-                    txt = (s.get("ref") or "") + " " + (s.get("name") or "")
-                    hint = None
-                    low = txt.lower()
-                    if "tunnel" in low or "underpass" in low:
-                        hint = "tunnel/underpass (LPG tankers prohibited)"
-                        sev = "BLOCKER"
-                    elif "gate" in low or "bollard" in low or "ford" in low:
-                        hint = low.split()[0]  # simple label
-                        sev = "ATTENTION"
-                    if hint:
-                        # approximate distance-from-end by nearest coord index
-                        if "geometry" in s and "coordinates" in s["geometry"] and s["geometry"]["coordinates"]:
-                            idx = min(len(coords)-1, len(coords)-len(s["geometry"]["coordinates"]))
-                        else:
-                            idx = len(coords)//2
-                        mile_from_site = cum_to_end[idx]/1609.344
-                        issues.append({"Severity": sev, "Issue": hint, "Mile from site": f"{mile_from_site:.1f}"})
+            # ---------- Route analysis (last 20 miles) ----------
+            st.markdown("### Route analysis (last 20 miles) ↪")
+            rs = auto.get("route_snap") or {}
+            full = rs.get("full_miles")
+            st.caption(f"Full route: {full if full is not None else 'n/a'} miles • Analysed segment: ~last 20 miles (nearest to site)")
 
-                # filter to last 20 miles
-                issues = [i for i in issues if float(i["Mile from site"]) <= 20.0]
-                st.caption(f"Full route: {full_miles:.1f} miles, {full_min:.0f} min • Analysed segment: {min(20.0, full_miles):.1f} miles (nearest to site)")
-                if issues:
-                    idf = pd.DataFrame(issues); idf.index = range(1, len(idf)+1); idf.index.name=""
-                    st.table(idf)
-                else:
-                    st.info("No notable flags detected within the last 20 miles (based on directions text). A manual review is still recommended.")
-            else:
-                st.caption("Route snapshot unavailable (OSRM).")
+            # Counts panel (always show)
+            counts = rs.get("counts") or {}
+            pretty = {
+                "Gates/barriers": counts.get("barrier_gate", 0),
+                "Bollards": counts.get("bollard", 0),
+                "Tunnels/underpass": counts.get("tunnel", 0),
+                "Fords": counts.get("ford", 0),
+                "Low bridge / Height": counts.get("height", 0),
+                "Weight limits": counts.get("weight", 0),
+                "Width limits / Narrow": counts.get("width", 0) + counts.get("narrow", 0),
+                "Level crossing / Rail": counts.get("rail", 0),
+                "Private / No through": counts.get("private", 0),
+                "Construction/closures": counts.get("construction", 0),
+            }
+            # badge colour
+            def badge(v:int)->str:
+                if v <= 0: col="#289e41"
+                elif v==1: col="#e0a10b"
+                else: col="#cc2b2b"
+                return f"<span style='background:{col};color:#fff;border-radius:8px;padding:2px 8px;font-weight:600'>{v}</span>"
 
-            # ---------- PDF export ----------
-            st.markdown("### Export")
+            ccols = st.columns(2)
+            idx = 0
+            for k, v in pretty.items():
+                with ccols[idx%2]:
+                    st.markdown(f"<div style='margin-bottom:6px'><b>{k}:</b> {badge(v)}</div>", unsafe_allow_html=True)
+                idx += 1
+
+            if sum(pretty.values()) == 0:
+                st.info("No notable flags detected within the last 20 miles (based on directions text). A manual review is still recommended.")
+
+            st.markdown("---")
+            st.subheader("Export")
             st.caption("Generate a one-page PDF summary (includes key metrics, separations, vehicle, AI commentary, controls, and map if available).")
+
             map_path = None
             if MAPBOX_TOKEN:
                 img = fetch_map(st.session_state["auto"]["lat"], st.session_state["auto"]["lon"])
@@ -1134,6 +1337,7 @@ if auto:
                         if line:
                             c.drawString(M, y, line); y -= leading
 
+                # Title
                 header(f"LPG Pre-Check — ///{st.session_state.get('w3w','')}")
                 addr = ctx["addr"]
                 addr_line = ", ".join([p for p in [addr.get("road"), addr.get("city"), addr.get("postcode")] if p])
@@ -1146,6 +1350,7 @@ if auto:
                     else:
                         text_line(f"Nearest hospital: {addr['hospital_name']}", col=grey)
 
+                # Map
                 if map_file and os.path.exists(map_file):
                     try:
                         ir = ImageReader(map_file)
@@ -1158,17 +1363,20 @@ if auto:
                     except Exception:
                         pass
 
+                # Key metrics
                 header("Key Metrics", size=13)
                 text_line(f"Wind: {ctx['wind']['speed_mps']:.1f} m/s from {ctx['wind']['compass']}", col=grey)
                 text_line(f"Slope: {ctx['slope_pct']:.1f}%   |   Approach avg/max: {ctx['approach_avg']:.1f}% / {ctx['approach_max']:.1f}%", col=grey)
                 rr_txt = ("n/a" if ctx.get("route_ratio") in (None, "", "n/a") else f"{ctx['route_ratio']:.2f}× crow-fly")
                 text_line(f"Route indirectness: {rr_txt}", col=grey)
 
+                # Vehicle
                 header("Vehicle", size=13)
                 text_line(f"Type: {ctx['vehicle']['type']}", col=grey)
                 text_line(f"Dimensions (L×W×H m): {ctx['vehicle']['length_m']:.1f} × {ctx['vehicle']['width_m']:.2f} × {ctx['vehicle']['height_m']:.2f}", col=grey)
                 text_line(f"Turning circle: {ctx['vehicle']['turning_circle_m']:.1f} m", col=grey)
 
+                # Separations
                 header("Separations (~400 m)", size=13)
                 feats = ctx["feats"]
                 sep_lines = [
@@ -1183,19 +1391,30 @@ if auto:
                 ]
                 for l in sep_lines: text_line(l)
 
+                # Risk
                 header("Risk score", size=13)
                 text_line(f"Total: {ctx['risk'].score:.1f}/100 → {ctx['risk'].status}", bold=True)
                 for p, m in ctx['risk'].explain[:7]:
                     text_line(f"+{p} {m}")
 
+                # Controls
                 header("Recommended controls", size=13)
                 for b in ctx["controls"]:
                     wrap_paragraph("• " + b)
 
-                for head in ["Safety Risk Profile","Environmental Considerations","Access & Logistics","Overall Site Suitability"]:
-                    y -= 8; header(head, size=13); wrap_paragraph(ai_text.get(head, ""))
+                # AI sections
+                for head in [
+                    "Safety Risk Profile",
+                    "Environmental Considerations",
+                    "Access & Logistics",
+                    "Overall Site Suitability",
+                ]:
+                    y -= 8
+                    header(head, size=13)
+                    wrap_paragraph(ai_text.get(head, ""))
 
-                c.showPage(); c.save()
+                c.showPage()
+                c.save()
                 return buf.getvalue()
 
             ctx_pdf = {
@@ -1219,6 +1438,12 @@ if auto:
 
             pdf_bytes = build_pdf_bytes(ctx_pdf, ai, controls_list, map_path)
             if pdf_bytes:
-                st.download_button("📄 Download PDF report", data=pdf_bytes, file_name=f"precheck_{st.session_state.get('w3w','site')}.pdf", mime="application/pdf", use_container_width=True)
+                st.download_button(
+                    "📄 Download PDF report",
+                    data=pdf_bytes,
+                    file_name=f"precheck_{st.session_state.get('w3w','site')}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
             else:
                 st.caption("PDF generation unavailable on this host (ReportLab not installed).")
