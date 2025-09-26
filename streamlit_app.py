@@ -623,9 +623,9 @@ def detailed_route_analysis(
     veh_w = (vehicle or {}).get("width_m")
     veh_mass = (vehicle or {}).get("mass_t")   # optional; may be None
     veh_turn = (vehicle or {}).get("turning_circle_m")
-
+    from here
     conflicts = []   # rows to display
-    flag_points = [] # map pins
+    flag_points = [] # map pins (now always include, colour-coded)
     disp_rows = []   # full (flagged) rows for table/CSV
 
     for idx, stp in enumerate(steps):
@@ -640,10 +640,12 @@ def detailed_route_analysis(
         ])
         txt = raw_txt.lower()
 
-        # update simple counts
+        # update simple counts (for badges)
+        hit_keys = []
         for k, pat in base_rx.items():
             if re.search(pat, txt):
                 counts[k] += 1
+                hit_keys.append(k)
 
         # parse numeric limits
         lims = parse_limits(raw_txt)
@@ -682,38 +684,69 @@ def detailed_route_analysis(
                 else:
                     verdicts.append("PASS")
 
-        # If no numeric limits but step says narrow/tunnel/… we can mark ATTENTION
-        if not lims and re.search(r'\bnarrow\b', txt) and veh_w is not None:
-            # heuristic: very wide vehicles should be careful on narrow road
-            if veh_w >= 2.55:
-                verdicts.append("ATTENTION")
-                reason_bits.append("narrow road noted")
+        # Advisory when only keywords (no numbers)
+        advisory_reasons = {
+            "tunnel": "tunnel/underpass noted",
+            "rail": "level crossing / rail noted",
+            "ford": "ford noted",
+            "barrier_gate": "gate/barrier noted",
+            "bollard": "bollards noted",
+            "construction": "construction/closure noted",
+            "private": "private / no through road noted",
+            "narrow": "narrow road noted",
+            "height": "height restriction mentioned",
+            "width": "width restriction mentioned",
+            "weight": "weight restriction mentioned",
+        }
+        if not lims and hit_keys:
+            verdicts.append("ATTENTION")
+            # collect unique reasons
+            reason_bits.extend({advisory_reasons[k] for k in hit_keys if k in advisory_reasons})
 
-        # Save only steps that had any limit or notable keyword
-        if lims or reason_bits:
-            loc = stp.get("maneuver", {}).get("location") or [None, None]
-            lon, lat = (loc[0], loc[1]) if len(loc) == 2 else (None, None)
-            step_verdict = "PASS"
-            if "BLOCKER" in verdicts:
-                step_verdict = "BLOCKER"
-            elif "ATTENTION" in verdicts:
-                step_verdict = "ATTENTION"
+        # If truly nothing interesting, skip
+        if not lims and not reason_bits:
+            continue
 
-            row = {
-                "Distance to site (mi)": round(rem / 1609.344, 2),
-                "Road": stp.get("name") or stp.get("ref") or "(unnamed)",
-                "Instruction": stp.get("maneuver", {}).get("instruction") or "",
-                "Restriction": ", ".join([f"{k}={v}" for k, v in lims.items()]) if lims else "advisory",
-                "Vehicle": f"H={veh_h or 'n/a'}m • W={veh_w or 'n/a'}m" + (f" • WT={veh_mass:.1f}t" if veh_mass is not None else ""),
-                "Verdict": step_verdict,
-                "_lat": lat, "_lon": lon,
-            }
-            disp_rows.append(row)
+        # Build row + map point
+        loc = stp.get("maneuver", {}).get("location") or [None, None]
+        lon, lat = (loc[0], loc[1]) if len(loc) == 2 else (None, None)
 
-            if lat is not None and lon is not None and step_verdict != "PASS":
-                flag_points.append({"lat": lat, "lon": lon, "flags": step_verdict, "name": row["Restriction"]})
+        step_verdict = "PASS"
+        if "BLOCKER" in verdicts:
+            step_verdict = "BLOCKER"
+        elif "ATTENTION" in verdicts:
+            step_verdict = "ATTENTION"
 
+        # colour by verdict
+        col = [80, 150, 255]    # PASS
+        if step_verdict == "ATTENTION":
+            col = [230, 160, 20]
+        if step_verdict == "BLOCKER":
+            col = [200, 30, 30]
+
+        row = {
+            "Distance to site (mi)": round(rem / 1609.344, 2),
+            "Road": stp.get("name") or stp.get("ref") or "(unnamed)",
+            "Instruction": stp.get("maneuver", {}).get("instruction") or "",
+            "Restriction": ", ".join([f"{k}={v}" for k, v in lims.items()]) if lims else ("; ".join(reason_bits) or "advisory"),
+            "Vehicle": f"H={veh_h or 'n/a'}m • W={veh_w or 'n/a'}m" + (f" • WT={veh_mass:.1f}t" if veh_mass is not None else ""),
+            "Verdict": step_verdict,
+            "_lat": lat, "_lon": lon,
+        }
+        disp_rows.append(row)
+
+        if lat is not None and lon is not None:
+            flag_points.append({
+                "lat": lat, "lon": lon,
+                "verdict": step_verdict,
+                "name": row["Road"],
+                "text": row["Restriction"],
+                "color": col,
+            })
+
+        if reason_bits:
             conflicts.append({"verdict": step_verdict, "why": "; ".join(reason_bits)})
+
 
     miles = round((route.get("distance") or 0.0) / 1609.344, 1)
     eta_min = round((route.get("duration") or 0.0) / 60.0)
@@ -1579,20 +1612,20 @@ if auto:
                         )
                         flag_layer = pdk.Layer(
                             "ScatterplotLayer",
-                            detail["flags"],
+                            detail["flags"],                # unchanged variable name
                             get_position=["lon", "lat"],
-                            get_fill_color=[200, 30, 30],
+                            get_fill_color="color",         # ← use per-point color
                             get_radius=60,
                             pickable=True,
                         )
-                        view_state = pdk.ViewState(latitude=auto["lat"], longitude=auto["lon"], zoom=11)
                         st.pydeck_chart(
                             pdk.Deck(
                                 layers=[path_layer, flag_layer],
                                 initial_view_state=view_state,
-                                tooltip={"text": "{flags}\n{name}"}
+                                tooltip={"text": "{verdict}\n{text}"},
                             )
                         )
+
             
                     # Conflicts table
                     if detail["steps"]:
@@ -1614,4 +1647,5 @@ if auto:
                         )
                     else:
                         st.info("No vehicle-specific conflicts detected in the analysed segment.")
+
 
