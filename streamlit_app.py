@@ -999,7 +999,7 @@ def build_pdf_report(ctx: Dict) -> bytes:
 
     # ---------- header (TITLE LEFT, LOGO RIGHT) ----------
     # logo scaled to ~256 px wide ≈ 256 pt ≈ 90.3 mm
-    logo_w = 256  # points
+    logo_w = 128  # points
     logo_im = None
     try:
         logo_path = ctx.get("logo_file")
@@ -2002,6 +2002,7 @@ if auto:
                         )
                     else:
                         st.info("No vehicle-specific conflicts detected in the analysed segment.")
+
 
 
 
