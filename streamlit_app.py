@@ -686,22 +686,30 @@ def detailed_route_analysis(
 
         # Advisory when only keywords (no numbers)
         advisory_reasons = {
-            "tunnel": "tunnel/underpass noted",
-            "rail": "level crossing / rail noted",
-            "ford": "ford noted",
-            "barrier_gate": "gate/barrier noted",
-            "bollard": "bollards noted",
-            "construction": "construction/closure noted",
-            "private": "private / no through road noted",
-            "narrow": "narrow road noted",
-            "height": "height restriction mentioned",
-            "width": "width restriction mentioned",
-            "weight": "weight restriction mentioned",
+            "tunnel": "Tunnel/underpass noted",
+            "rail": "Level crossing / rail noted",
+            "ford": "Ford noted",
+            "barrier_gate": "Gate/barrier noted",
+            "bollard": "Bollards noted",
+            "construction": "Construction/closure noted",
+            "private": "Private / no through road noted",
+            "narrow": "Narrow road noted",
+            "height": "Height restriction mentioned",
+            "width": "Width restriction mentioned",
+            "weight": "Weight restriction mentioned",
         }
+        
         if not lims and hit_keys:
+            # always mark ATTENTION if keywords hit
             verdicts.append("ATTENTION")
-            # collect unique reasons
-            reason_bits.extend({advisory_reasons[k] for k in hit_keys if k in advisory_reasons})
+        
+            for k in hit_keys:
+                if k == "narrow" and veh_w is not None and veh_w >= 2.3:
+                    # special case: wide vehicle on narrow road
+                    reason_bits.append(f"Narrow road caution — vehicle width {veh_w:.2f} m")
+                elif k in advisory_reasons:
+                    reason_bits.append(advisory_reasons[k])
+
 
         # If truly nothing interesting, skip
         if not lims and not reason_bits:
@@ -1661,6 +1669,7 @@ if auto:
                         )
                     else:
                         st.info("No vehicle-specific conflicts detected in the analysed segment.")
+
 
 
 
