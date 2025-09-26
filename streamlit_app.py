@@ -433,31 +433,56 @@ def fetch_map(lat, lon, zoom=17, size=(1000, 700)) -> Optional[Image.Image]:
 
 # ------------------------- AI commentary -------------------------
 def _offline_ai_sections(ctx: Dict) -> Dict[str, str]:
-    feats, wind = ctx["feats"], ctx["wind"]
-    slope_pct = ctx["slope_pct"] or 0.0
-    risk = ctx["risk"]; sides = ctx["enclosure_sides"]
-    los = ctx["los_issue"]; veg = ctx["veg_3m"]
+    feats = ctx["feats"]
+    wind = ctx["wind"]
+    slope_pct = ctx.get("slope_pct") or 0.0
+    risk = ctx["risk"]
+    sides = ctx.get("enclosure_sides", 0)
+    los = bool(ctx.get("los_issue"))
+    veg = ctx.get("veg_3m", 0)
     land = feats.get("land_class", "n/a")
+
+    # Build a compact drivers string safely
+    drivers = "; ".join([f"{p} {m}" for p, m in (risk.explain[:5] if getattr(risk, "explain", []) else [])])
+    if not drivers:
+        drivers = "no major contributors"
+
+    spd = wind.get("speed_mps")
+    spd_txt = f"{(0.0 if spd is None else spd):.1f}"
+    comp = wind.get("compass") or "n/a"
+
     s1 = (
         f"The local slope is {slope_pct:.1f}%. Key separations (m): "
         f"building {feats.get('building_m','n/a')}, boundary n/a, road {feats.get('road_m','n/a')}, "
         f"drain {feats.get('drain_m','n/a')}, overhead {feats.get('overhead_m','n/a')}, rail {feats.get('rail_m','n/a')}. "
-        f"Wind {wind.get('speed_mps') or 0:.1f} m/s from {wind.get('compass') or 'n/a'}. "
-        f"Heuristic {risk.score:.1f}/100 → {risk.status}. Drivers: "
-        + "; ".join([f\"{p} {m}\" for p, m in risk.explain[:5]]) + "."
+        f"Wind {spd_txt} m/s from {comp}. Heuristic {risk.score:.1f}/100 → {risk.status}. "
+        f"Drivers: {drivers}."
     )
+
     s2 = (
         f"Flood Low (No mapped watercourse nearby). Watercourse ~{feats.get('water_m','n/a')} m; "
-        f"drains/manholes {feats.get('drain_m','n/a')} m. Land use {land}. Vegetation within 3 m: level {veg}."
+        f"drains/manholes {feats.get('drain_m','n/a')} m. Land use {land}. "
+        f"Vegetation within 3 m: level {veg}."
     )
+
     s3 = (
         f"Access lines of sight: {'restricted' if los else 'clear'}; "
         f"enclosure effect {sides} solid side(s). Validate signage/restrictions; "
         f"provide sound hardstanding and clear sightlines."
     )
-    s4 = "Attention required — ensure separation compliance, ignition control, drainage protection, and safe approach/egress."
-    return {"Safety Risk Profile": s1, "Environmental Considerations": s2,
-            "Access & Logistics": s3, "Overall Site Suitability": s4}
+
+    s4 = (
+        "Attention required — ensure separation compliance, ignition control, drainage protection, "
+        "and safe approach/egress."
+    )
+
+    return {
+        "Safety Risk Profile": s1,
+        "Environmental Considerations": s2,
+        "Access & Logistics": s3,
+        "Overall Site Suitability": s4,
+    }
+
 
 def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
     if not OPENAI_API_KEY: raise RuntimeError("No OpenAI key")
@@ -1167,3 +1192,4 @@ if auto:
                 )
             else:
                 st.caption("PDF generation unavailable on this host (ReportLab not installed).")
+
