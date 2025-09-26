@@ -1618,19 +1618,19 @@ if auto:
             "hospital_distance_m": (auto.get("hospital", {}) or {}).get("distance_m", None),
         }
         
-# --- Build recommended controls once (before columns) ---
-controls_list = [
-    "Use a trained banksman during manoeuvres and reversing.",
-    "Add temporary cones/signage; consider a convex mirror or visibility aids.",
-    "Plan approach/egress to avoid reversing where practicable.",
-]
-if stand_surface in ("gravel", "grass"):
-    controls_list.append("Ensure firm, level stand surface (temporary mats if required).")
-if overhead_m is not None and overhead_m < CoP["overhead_info_m"]:
-    controls_list.append("Confirm isolation/clearance for overhead power; position tanker outside bands.")
-# Light tunnel hint based on quick analysis:
-if (auto.get("route_snap", {}).get("counts", {}).get("tunnel", 0) or 0) > 0:
-    controls_list.append("⚠️ LPG tankers: tunnels/underpasses noted on approach — plan a compliant diversion.")
+        # --- Build recommended controls once (before columns) ---
+        controls_list = [
+            "Use a trained banksman during manoeuvres and reversing.",
+            "Add temporary cones/signage; consider a convex mirror or visibility aids.",
+            "Plan approach/egress to avoid reversing where practicable.",
+        ]
+        if stand_surface in ("gravel", "grass"):
+            controls_list.append("Ensure firm, level stand surface (temporary mats if required).")
+        if overhead_m is not None and overhead_m < CoP["overhead_info_m"]:
+            controls_list.append("Confirm isolation/clearance for overhead power; position tanker outside bands.")
+        # Light tunnel hint based on quick analysis:
+        if (auto.get("route_snap", {}).get("counts", {}).get("tunnel", 0) or 0) > 0:
+            controls_list.append("⚠️ LPG tankers: tunnels/underpasses noted on approach — plan a compliant diversion.")
 
         left, right = st.columns([0.45, 0.55])
 
@@ -1927,6 +1927,7 @@ if (auto.get("route_snap", {}).get("counts", {}).get("tunnel", 0) or 0) > 0:
                         )
                     else:
                         st.info("No vehicle-specific conflicts detected in the analysed segment.")
+
 
 
 
