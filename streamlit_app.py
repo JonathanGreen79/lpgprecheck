@@ -915,28 +915,30 @@ def build_pdf_report(ctx: Dict) -> bytes:
             pass
         return None
 
+    ###
     def _kv_table(d: Dict, ncols=2):
-        """Return a single Table with ncols key/value pairs per row."""
         items = list(d.items())
+    
         rows = []
         for i in range(0, len(items), ncols):
             slice_items = items[i:i+ncols]
             row = []
             for k, v in slice_items:
                 row.append(Paragraph(f"<b>{k}:</b>", styleN))
-                row.append(str(v if v not in (None, "") else "—"))
-            # pad last row if short
-            while len(row) < ncols * 2:
+                row.append(Paragraph(str(v if v not in (None, "") else "—"), styleN))
+            while len(row) < ncols*2:
                 row.append("")
-            rows.append(row)
     
-        t = Table(rows, colWidths=[35*mm, 55*mm] * ncols, hAlign="LEFT")
+        # Two-column block: (30mm key, 58mm value) × ncols  ->  (30+58)*2 = 176mm fits A4 printable width
+        t = Table(rows, colWidths=[30*mm, 58*mm]*ncols, hAlign="LEFT")
         t.setStyle(TableStyle([
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("VALIGN",        (0,0), (-1,-1), "TOP"),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+            ("LEFTPADDING",   (0,0), (-1,-1), 0),
+            ("RIGHTPADDING",  (0,0), (-1,-1), 6),
         ]))
         return t
+
 
         # rows is a list of small 1-row tables to get nice vertical spacing
         flow = []
@@ -2002,6 +2004,7 @@ if auto:
                         )
                     else:
                         st.info("No vehicle-specific conflicts detected in the analysed segment.")
+
 
 
 
