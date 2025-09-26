@@ -1430,6 +1430,191 @@ if auto:
             "hospital_name": hosp_name,
             "hospital_distance_m": (auto.get("hospital", {}) or {}).get("distance_m", None),
         }
+# ---------- NICE MULTI-PAGE PDF (Platypus) ----------
+def build_pdf_report(ctx: Dict) -> bytes:
+    """
+    Build a multi-page PDF that includes logo, tank image, address/header,
+    key metrics, separations, vehicle, nearest depots, quick route snapshot,
+    AI commentary, recommended controls, map, and route counts.
+
+    ctx keys expected (safe to miss, we 'get' with defaults):
+      w3w, addr (dict), map_file (optional path), logo_file (optional path), tank_file (optional path)
+      key_metrics (dict), separations (dict), vehicle (dict),
+      nearest_depots (list of dicts with name/miles), route_snap (dict),
+      ai (dict of 4 sections), controls (list of str), route_counts (dict)
+    """
+    try:
+        # ReportLab (Platypus)
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib import colors
+        from reportlab.lib.units import mm
+    except Exception:
+        return b""
+
+    # ---------- helpers ----------
+    def _img(path, max_w=170*mm, max_h=40*mm):
+        try:
+            if path and os.path.exists(path):
+                im = Image(path)
+                # scale keeping aspect
+                iw, ih = im.wrap(0, 0)
+                sc = min(max_w/iw, max_h/ih)
+                im._restrictSize(iw*sc, ih*sc)
+                return im
+        except Exception:
+            pass
+        return None
+
+    def _kv_table(d: Dict, ncols=2):
+        # Flatten into rows of key/value; auto split into ncols*2 table
+        items = list(d.items())
+        # chunk into rows for ncols
+        rows = []
+        for i in range(0, len(items), ncols):
+            slice_items = items[i:i+ncols]
+            row = []
+            for k, v in slice_items:
+                row.append(Paragraph(f"<b>{k}:</b>", styleN))
+                row.append(str(v if v not in (None, "") else "—"))
+            # pad if last row short
+            while len(row) < ncols*2:
+                row.append("")
+            rows.append(row)
+        t = Table(rows, colWidths=[35*mm, 55*mm]*ncols, hAlign="LEFT")
+        t.setStyle(TableStyle([
+            ("VALIGN", (0,0), (-1,-1), "TOP"),
+            ("TEXTCOLOR", (0,0), (-1,-1), colors.black),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+        ]))
+        return t
+
+    def _title(txt): return Paragraph(f"<para spaceb=6><b>{txt}</b></para>", styleH)
+    def _caption(txt): return Paragraph(f"<font size=9 color='#666666'>{txt}</font>", styleN)
+
+    # ---------- styles ----------
+    styles = getSampleStyleSheet()
+    styleN  = styles["BodyText"]
+    styleN.leading = 12
+    styleH = ParagraphStyle("H", parent=styles["Heading2"], spaceBefore=6, spaceAfter=6)
+    styleH.fontSize = 12
+    styleH.leading = 14
+    styleT = ParagraphStyle("T", parent=styles["Title"], fontSize=16, leading=18)
+
+    # ---------- doc ----------
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=16*mm, rightMargin=16*mm,
+        topMargin=16*mm, bottomMargin=16*mm,
+        title="LPG Pre-Check"
+    )
+    story = []
+
+    # ---------- header row (logo + title + tank image) ----------
+    logo_im = _img(ctx.get("logo_file"))
+    tank_im = _img(ctx.get("tank_file"), max_w=60*mm, max_h=25*mm)
+
+    title_txt = f"LPG Customer Tank — Pre-Check"
+    w3w = ctx.get("w3w") or ""
+    sub_txt = f"///{w3w}" if w3w else ""
+
+    title_block = [Paragraph(title_txt, styleT)]
+    if sub_txt: title_block.append(Paragraph(sub_txt, styleN))
+
+    # 3-column header
+    header_cells = [[logo_im or "", title_block, tank_im or ""]]
+    header_tbl = Table(header_cells, colWidths=[45*mm, None, 45*mm])
+    header_tbl.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
+    story += [header_tbl, Spacer(1, 6*mm)]
+
+    # address
+    addr = ctx.get("addr") or {}
+    addr_line = ", ".join([p for p in [addr.get("road"), addr.get("city"), addr.get("postcode")] if p])
+    if addr_line:
+        story += [_caption(addr_line)]
+    if addr.get("display_name"):
+        story += [_caption(addr.get("display_name"))]
+    story += [Spacer(1, 3*mm)]
+
+    # ---------- KEY METRICS ----------
+    story += [_title("Key metrics"), _kv_table(ctx.get("key_metrics", {})), Spacer(1, 3*mm)]
+
+    # ---------- SEPARATIONS ----------
+    story += [_title("Separations (~400 m)"), _kv_table(ctx.get("separations", {})), Spacer(1, 3*mm)]
+
+    # ---------- VEHICLE ----------
+    story += [_title("Vehicle"), _kv_table(ctx.get("vehicle", {})), Spacer(1, 3*mm)]
+
+    # ---------- NEAREST DEPOTS ----------
+    dep3 = ctx.get("nearest_depots") or []
+    if dep3:
+        story += [_title("Top 3 nearest depots (crow-fly)")]
+        rows = [["Depot", "Distance (miles)"]] + [[d["name"], f"{d['miles']:.1f}"] for d in dep3]
+        t = Table(rows, colWidths=[70*mm, 35*mm])
+        t.setStyle(TableStyle([
+            ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
+            ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
+            ("ALIGN", (1,1), (-1,-1), "RIGHT"),
+        ]))
+        story += [t, Spacer(1, 3*mm)]
+
+    # ---------- ROUTE SNAPSHOT ----------
+    rs = ctx.get("route_snap", {}) or {}
+    if rs:
+        story += [_title("Quick route snapshot (nearest depot)")]
+        rt = Table([
+            ["Driving distance", f"{rs.get('miles','n/a')} mi",
+             "ETA (typical)", f"{rs.get('eta_min','n/a')} min"],
+            ["Final approach", rs.get("final_road") or "n/a",
+             "Approach bearing", f"{rs.get('approach_compass','n/a')} ({rs.get('approach_deg','n/a')}°)"],
+            ["Last-mile winding", rs.get("winding") or "n/a", "", ""],
+        ], colWidths=[38*mm, 52*mm, 38*mm, 52*mm])
+        rt.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP")]))
+        story += [rt, Spacer(1, 3*mm)]
+
+    # ---------- AI COMMENTARY ----------
+    ai = ctx.get("ai") or {}
+    if ai:
+        story += [_title("AI commentary")]
+        for head in ["Safety Risk Profile", "Environmental Considerations", "Access & Logistics", "Overall Site Suitability"]:
+            body = ai.get(head, "")
+            story += [Paragraph(f"<b>{head}</b>", styleN), Paragraph(body or "—", styleN), Spacer(1, 2*mm)]
+
+    # ---------- CONTROLS ----------
+    controls = ctx.get("controls") or []
+    if controls:
+        story += [_title("Recommended controls")]
+        for c in controls:
+            story.append(Paragraph(f"• {c}", styleN))
+        story += [Spacer(1, 3*mm)]
+
+    # ---------- MAP ----------
+    mp = _img(ctx.get("map_file"), max_w=178*mm, max_h=120*mm)
+    if mp:
+        story += [_title("Map (centered on W3W)"), mp, Spacer(1, 3*mm)]
+
+    # ---------- ROUTE COUNTS ----------
+    rc = ctx.get("route_counts") or {}
+    if rc:
+        story += [_title("Route analysis (last 20 miles) — counts")]
+        rows = [["Gates/barriers", rc.get("barrier_gate", 0), "Bollards", rc.get("bollard", 0)],
+                ["Tunnels/underpass", rc.get("tunnel", 0), "Fords", rc.get("ford", 0)],
+                ["Low bridge / Height", rc.get("height", 0), "Weight limits", rc.get("weight", 0)],
+                ["Width limits / Narrow", (rc.get("width", 0) + rc.get("narrow", 0)), "Level crossing / Rail", rc.get("rail", 0)],
+                ["Private / No through", rc.get("private", 0), "Construction/closures", rc.get("construction", 0)]]
+        t = Table(rows, colWidths=[55*mm, 20*mm, 55*mm, 20*mm])
+        t.setStyle(TableStyle([
+            ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
+            ("ALIGN", (1,0), (-1,-1), "RIGHT"),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ]))
+        story += [t]
+
+    # ---------- build ----------
+    doc.build(story)
+    return buf.getvalue()
 
         left, right = st.columns([0.45, 0.55])
 
@@ -1492,6 +1677,63 @@ if auto:
                 img = fetch_map(st.session_state["auto"]["lat"], st.session_state["auto"]["lon"])
                 if img:
                     st.image(img, caption="Map (centered on W3W)", use_container_width=True)
+
+                # --- PDF: gather context and offer download ---
+                logo_file = COMPANY_LOGO if os.path.exists(COMPANY_LOGO) else None
+                tank_file = "tank.png" if os.path.exists("tank.png") else None  # optional tank illustration
+                
+                pdf_ctx = {
+                    "w3w": st.session_state.get("w3w",""),
+                    "addr": addr_edited,                   # edited address block you already build
+                    "map_file": map_path,                  # from earlier fetch_map() save
+                    "logo_file": logo_file,
+                    "tank_file": tank_file,
+                    # before + after sections
+                    "key_metrics": {
+                        "Wind (m/s)": f"{wind_mps:.1f}",
+                        "Wind dir (°/compass)": f"{wind_deg} / {wind['compass']}",
+                        "Slope (%)": f"{slope_pct:.1f}",
+                        "Approach avg/max (%)": f"{approach_avg:.1f} / {approach_max:.1f}",
+                        "Flood": "Low — No mapped watercourse nearby" if (water_m is None or (isinstance(water_m,(int,float)) and water_m >= 150)) else "Medium/High",
+                        "Nearest hospital": addr_edited.get("hospital_name","—"),
+                        "Hospital distance (km)": f"{((auto.get('hospital',{}) or {}).get('distance_m') or 0)/1000:.2f}",
+                    },
+                    "separations": {
+                        "Building (m)": building_m if building_m is not None else "—",
+                        "Boundary (m)": boundary_m if boundary_m is not None else "—",
+                        "Road/footpath (m)": road_m if road_m is not None else "—",
+                        "Drain/manhole (m)": drain_m if drain_m is not None else "—",
+                        "Overhead power lines (m)": overhead_m if overhead_m is not None else "—",
+                        "Railway (m)": rail_m if rail_m is not None else "—",
+                        "Watercourse (m)": water_m if water_m is not None else "—",
+                        "Land use": land_use,
+                    },
+                    "vehicle": {
+                        "Type": vehicle_type,
+                        "Length (m)": f"{veh_length_m:.1f}",
+                        "Width (m)": f"{veh_width_m:.2f}",
+                        "Height (m)": f"{veh_height_m:.2f}",
+                        "Turning circle (m)": f"{turning_circle_m:.1f}",
+                    },
+                    "nearest_depots": depots3,                # list of {"name","miles"}
+                    "route_snap": auto.get("route_snap", {}), # miles/eta/final road/approach/winding
+                    "ai": ai,                                 # four commentary sections
+                    "controls": controls_list,
+                    "route_counts": (auto.get("route_snap") or {}).get("counts", {}) or {},
+                }
+                
+                pdf_bytes2 = build_pdf_report(pdf_ctx)
+                if pdf_bytes2:
+                    st.download_button(
+                        "📄 Generate PDF report",
+                        data=pdf_bytes2,
+                        file_name=f"precheck_{st.session_state.get('w3w','site')}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
+                else:
+                    st.caption("PDF generation unavailable on this host (ReportLab not installed).")
+
 
         with right:
             st.markdown("### AI commentary")
@@ -1669,6 +1911,7 @@ if auto:
                         )
                     else:
                         st.info("No vehicle-specific conflicts detected in the analysed segment.")
+
 
 
 
