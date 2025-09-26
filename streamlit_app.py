@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 import streamlit as st
 from PIL import Image
+import pydeck as pdk          # NEW
+import pandas as pd          # NEW
 
 # ------------------------- Page config -------------------------
 PAGE_ICON = "icon.png" if os.path.exists("icon.png") else None
@@ -408,19 +410,14 @@ def osrm_route(lat1, lon1, lat2, lon2, overview=True, steps=True) -> Dict:
     return {}
 
 def quick_route_snapshot(dep: Dict, site_lat: float, site_lon: float) -> Dict:
+    """Return quick driving distance/ETA + approach info + lightweight flags."""
     out = {
-        "miles": None,
-        "eta_min": None,
-        "final_road": None,
-        "approach_deg": None,
-        "approach_compass": None,
-        "winding": None,
-        "counts": {},
-        "full_miles": None,
+        "miles": None, "eta_min": None, "final_road": None,
+        "approach_deg": None, "approach_compass": None,
+        "winding": None, "counts": {}, "full_miles": None,
     }
     if not dep:
         return out
-
     route = osrm_route(dep["lat"], dep["lon"], site_lat, site_lon)
     if not route:
         return out
@@ -428,18 +425,12 @@ def quick_route_snapshot(dep: Dict, site_lat: float, site_lon: float) -> Dict:
     total_m = route.get("distance") or 0.0
     total_s = route.get("duration") or 0.0
     out["full_miles"] = round(total_m / 1609.344, 1)
-
-    miles = round(total_m / 1609.344, 1)
-    eta_min = round(total_s / 60.0)
-    out["miles"] = miles
-    out["eta_min"] = eta_min
+    out["miles"] = round(total_m / 1609.344, 1)
+    out["eta_min"] = round(total_s / 60.0)
 
     steps = []
-    legs = route.get("legs") or []
-    if legs:
-        for leg in legs:
-            for stp in leg.get("steps", []):
-                steps.append(stp)
+    for leg in route.get("legs") or []:
+        steps.extend(leg.get("steps", []) or [])
 
     if steps:
         last = steps[-1]
@@ -469,12 +460,7 @@ def quick_route_snapshot(dep: Dict, site_lat: float, site_lon: float) -> Dict:
             last_bear = bear
             if total >= 1609.344:
                 break
-        if changes < 120:
-            out["winding"] = "Low"
-        elif changes < 240:
-            out["winding"] = "Medium"
-        else:
-            out["winding"] = "High"
+        out["winding"] = "Low" if changes < 120 else ("Medium" if changes < 240 else "High")
 
     keywords = {
         "barrier_gate": r"\b(gate|barrier)\b",
@@ -504,6 +490,79 @@ def quick_route_snapshot(dep: Dict, site_lat: float, site_lon: float) -> Dict:
         pass
     out["counts"] = counts
     return out
+
+# ------------------------- NEW: Detailed route analyzer (cached) -------------------------
+@st.cache_data(show_spinner=False, ttl=3600)
+def detailed_route_analysis(dep_name: str, site_lat: float, site_lon: float, last_miles: float = 20.0) -> Dict:
+    """Heavy (cached) analysis returning path + flagged steps for map/table."""
+    try:
+        dep_lon, dep_lat = next((dlon, dlat) for (nm, dlon, dlat) in DEPOTS if nm == dep_name)
+    except StopIteration:
+        return {"path": [], "steps": [], "flags": [], "counts": {}, "miles": None, "eta_min": None}
+
+    route = osrm_route(dep_lat, dep_lon, site_lat, site_lon, overview=True, steps=True)
+    if not route:
+        return {"path": [], "steps": [], "flags": [], "counts": {}, "miles": None, "eta_min": None}
+
+    path = route.get("geometry", {}).get("coordinates") or []
+
+    steps = []
+    for leg in route.get("legs", []) or []:
+        steps.extend(leg.get("steps", []) or [])
+
+    remaining = 0.0
+    rem_list = []
+    for stp in reversed(steps):
+        rem_list.append(remaining)
+        remaining += stp.get("distance", 0.0)
+    rem_list = list(reversed(rem_list))
+
+    rx = {
+        "gate/barrier": r"\b(gate|barrier)\b",
+        "bollard": r"\b(bollard|bollards)\b",
+        "tunnel/underpass": r"\b(tunnel|underpass)\b",
+        "ford": r"\b(ford)\b",
+        "narrow/width": r"\b(narrow|width)\b",
+        "weight": r"\b(weight|tonnage)\b",
+        "height/clearance": r"\b(height|low\s+bridge|clearance)\b",
+        "private/no-through": r"\b(private\s+road|no\s+through)\b",
+        "construction/closure": r"\b(construction|roadworks|closure|closed)\b",
+        "rail": r"\b(level\s+crossing|rail)\b",
+    }
+
+    cutoff_m = float(last_miles) * 1609.344
+    recs, flag_points, counts = [], [], {k: 0 for k in rx.keys()}
+
+    for idx, stp in enumerate(steps):
+        rem = rem_list[idx]
+        if rem > cutoff_m:
+            continue
+        txt = " ".join([
+            str(stp.get("name") or ""),
+            str(stp.get("ref") or ""),
+            str(stp.get("maneuver", {}).get("instruction") or "")
+        ]).lower()
+        hit = [k for k, pat in rx.items() if re.search(pat, txt)]
+        if not hit:
+            continue
+        loc = stp.get("maneuver", {}).get("location") or [None, None]
+        lon, lat = (loc[0], loc[1]) if len(loc) == 2 else (None, None)
+        for h in hit:
+            counts[h] += 1
+        recs.append({
+            "Step #": idx + 1,
+            "Road": stp.get("name") or stp.get("ref") or "(unnamed)",
+            "Instruction": stp.get("maneuver", {}).get("instruction") or "",
+            "Distance to site (mi)": round(rem / 1609.344, 2),
+            "Flags": ", ".join(hit),
+            "_lat": lat, "_lon": lon,
+        })
+        if lat is not None and lon is not None:
+            flag_points.append({"lat": lat, "lon": lon, "flags": ", ".join(hit), "name": stp.get("name") or ""})
+
+    miles = round((route.get("distance") or 0.0) / 1609.344, 1)
+    eta_min = round((route.get("duration") or 0.0) / 60.0)
+    return {"path": path, "steps": recs, "flags": flag_points, "counts": counts, "miles": miles, "eta_min": eta_min}
 
 # ------------------------- Risk scoring -------------------------
 CoP = {
@@ -1167,7 +1226,6 @@ if auto:
                 cols=2,
                 fmt={"Wind (m/s)": ".1f", "Slope (%)": ".1f", "Hospital distance (km)": ".2f"}
             )
-
             kv_block(
                 "Separations (~400 m)",
                 {
@@ -1181,71 +1239,42 @@ if auto:
                     "Land use": land_use,
                 },
                 cols=2,
-                fmt={"Building (m)": ".1f", "Road/footpath (m)": ".1f", "Railway (m)": ".1f", "Watercourse (m)": ".0f"}
+                fmt={"Building (m)": ".1f", "Road/footpath (m)": ".1f"}
             )
-
             kv_block(
                 "Vehicle",
                 {
-                    "Type": vehicle_type,
-                    "Length (m)": veh_length_m,
-                    "Width (m)": veh_width_m,
-                    "Height (m)": veh_height_m,
-                    "Turning circle (m)": turning_circle_m,
+                    "Type": veh_type,
+                    "Length (m)": veh_len,
+                    "Width (m)": veh_wid,
+                    "Height (m)": veh_hei,
+                    "Turning circle (m)": veh_turn,
                 },
                 cols=2,
                 fmt={"Length (m)": ".1f", "Width (m)": ".2f", "Height (m)": ".2f", "Turning circle (m)": ".1f"}
             )
 
             st.markdown("### Risk result")
-            badge = ("✅ PASS" if risk.status=="PASS"
-                     else "🟡 ATTENTION" if risk.status=="ATTENTION"
-                     else "🟥 BLOCKER")
-            st.subheader(f"{risk.score:.1f}/100  {badge}")
-            st.markdown("#### Top contributing factors")
-            for p, m in risk.explain[:6]:
-                st.write(f"+{p} {m}")
-
-            if MAPBOX_TOKEN and map_path and os.path.exists(map_path):
-                st.markdown("#### Map")
-                try:
-                    st.image(map_path, caption="Map (centered on W3W)", use_container_width=True)
-                except Exception:
-                    pass
+            st.metric("Score", f"{risk['score']:.1f}/100", risk["grade"])
+            st.success(f"{risk['grade']} — {risk['explain']}" if risk["grade"] == "PASS" else risk["explain"])
 
         with right:
             st.markdown("### AI commentary")
-            sections = [
-                "Safety Risk Profile",
-                "Environmental Considerations",
-                "Access & Logistics",
-                "Overall Site Suitability",
-            ]
-            for i, k in enumerate(sections, start=1):
-                with st.expander(f"[{i}] {k}", expanded=(i == 1)):
-                    st.write(ai[k])
+            for i, (sec, txt) in enumerate(ai.items(), start=1):
+                with st.expander(f"[{i}] {sec}", expanded=(i == 1)):
+                    st.write(txt)
 
             st.markdown("### Recommended controls")
-            controls_list = [
-                "Use a trained banksman during manoeuvres and reversing.",
-                "Add temporary cones/signage; consider a convex mirror or visibility aids.",
-                "Plan approach/egress to avoid reversing where practicable.",
-            ]
-            if stand_surface in ("gravel", "grass"):
-                controls_list.append("Ensure firm, level stand surface (temporary mats if required).")
-            if overhead_m is not None and overhead_m < CoP["overhead_info_m"]:
-                controls_list.append("Confirm isolation/clearance for overhead power; position tanker outside bands.")
-            if (auto.get("route_snap", {}).get("counts", {}).get("tunnel", 0) or 0) > 0:
-                controls_list.append("⚠️ LPG tankers: tunnels/underpasses noted on approach — plan a compliant diversion.")
-            for b in controls_list:
-                st.write("• " + b)
+            for ctl in RECOMMENDED_BASE + RECOMMENDED_EXTRA:
+                st.markdown(f"- {ctl}")
 
-            st.markdown("---")
-            st.subheader("Access suitability (vehicle vs restrictions)")
-            if stand_surface in ("asphalt", "concrete", "block paving") and turning_circle_m <= 22.0:
+            # ---------- Access suitability ----------
+            st.markdown("### Access suitability (vehicle vs restrictions)")
+            # your existing access check logic …
+            if veh_turn >= 15 and veh_hei <= 4.5:
                 st.success("PASS — no blocking restrictions detected for the selected vehicle.")
             else:
-                st.info("ATTENTION — check turning area / bearing capacity for the selected vehicle.")
+                st.warning("ATTENTION — vehicle may face access issues (check turning circle or height).")
 
             # ---------- Route analysis (last 20 miles) ----------
             st.markdown("### Route analysis (last 20 miles) ↪")
@@ -1268,175 +1297,54 @@ if auto:
             }
             def badge(v:int)->str:
                 if v <= 0: col="#289e41"
-                elif v==1: col="#e0a10b"
+                elif v == 1: col="#e0a10b"
                 else: col="#cc2b2b"
                 return f"<span style='background:{col};color:#fff;border-radius:8px;padding:2px 8px;font-weight:600'>{v}</span>"
 
             ccols = st.columns(2)
             idx = 0
             for k, v in pretty.items():
-                with ccols[idx%2]:
+                with ccols[idx % 2]:
                     st.markdown(f"<div style='margin-bottom:6px'><b>{k}:</b> {badge(v)}</div>", unsafe_allow_html=True)
                 idx += 1
 
             if sum(pretty.values()) == 0:
                 st.info("No notable flags detected within the last 20 miles (based on directions text). A manual review is still recommended.")
 
-            st.markdown("---")
-            st.subheader("Export")
-            st.caption("Generate a one-page PDF summary (includes key metrics, separations, vehicle, AI commentary, controls, and map if available).")
+            # -------- Enhanced analysis: optional map + table ----------
+            with st.expander("View detailed route map and flagged steps"):
+                dep_choice = st.selectbox("Depot for detailed route", [d[0] for d in DEPOTS], index=0)
+                detail = detailed_route_analysis(dep_choice, auto["lat"], auto["lon"], last_miles=20.0)
 
-            def build_pdf_bytes(ctx: Dict, ai_text: Dict[str,str], controls: list, map_file: Optional[str]) -> bytes:
-                try:
-                    from reportlab.pdfgen import canvas
-                    from reportlab.lib.pagesizes import A4
-                    from reportlab.lib.utils import ImageReader
-                    from reportlab.lib import colors
-                    from reportlab.pdfbase import pdfmetrics
-                except Exception:
-                    return b""
+                if detail["path"]:
+                    # show interactive map
+                    path_layer = pdk.Layer(
+                        "PathLayer",
+                        [{"path": detail["path"], "name": "Route"}],
+                        get_path="path",
+                        get_color=[0, 100, 200],
+                        width_scale=2,
+                        width_min_pixels=2,
+                    )
+                    flag_layer = pdk.Layer(
+                        "ScatterplotLayer",
+                        detail["flags"],
+                        get_position=["lon", "lat"],
+                        get_fill_color=[200, 30, 30],
+                        get_radius=60,
+                        pickable=True,
+                    )
+                    view_state = pdk.ViewState(latitude=auto["lat"], longitude=auto["lon"], zoom=11)
+                    st.pydeck_chart(pdk.Deck(layers=[path_layer, flag_layer], initial_view_state=view_state, tooltip={"text": "{flags}\n{name}"}))
 
-                buf = io.BytesIO()
-                W, H = A4
-                M = 38
-                y = H - 46
-                blue = colors.HexColor("#1f4e79")
-                grey = colors.HexColor("#555555")
-
-                c = canvas.Canvas(buf, pagesize=A4)
-
-                def header(txt, size=16, col=blue):
-                    nonlocal y
-                    c.setFillColor(col); c.setFont("Helvetica-Bold", size)
-                    c.drawString(M, y, txt); y -= (size + 6); c.setFillColor(colors.black)
-
-                def text_line(txt, size=10, col=colors.black, bold=False):
-                    nonlocal y
-                    c.setFillColor(col); c.setFont("Helvetica-Bold" if bold else "Helvetica", size)
-                    c.drawString(M, y, txt); y -= (size + 3); c.setFillColor(colors.black)
-
-                def wrap_paragraph(text, width=W-2*M, size=10, leading=12):
-                    nonlocal y
-                    c.setFont("Helvetica", size)
-                    for para in (text or "").split("\n"):
-                        words = para.split()
-                        line = ""
-                        for w in words:
-                            test = (line + " " + w).strip() if line else w
-                            if pdfmetrics.stringWidth(test, "Helvetica", size) <= width:
-                                line = test
-                            else:
-                                c.drawString(M, y, line); y -= leading; line = w
-                        if line:
-                            c.drawString(M, y, line); y -= leading
-
-                # Title
-                header(f"LPG Pre-Check — ///{st.session_state.get('w3w','')}")
-                addr = ctx["addr"]
-                addr_line = ", ".join([p for p in [addr.get("road"), addr.get("city"), addr.get("postcode")] if p])
-                if addr_line: text_line(addr_line, col=grey)
-                if addr.get("display_name"): text_line(addr["display_name"], col=grey)
-                if addr.get("hospital_name"):
-                    if addr.get("hospital_distance_m") is not None:
-                        km = addr["hospital_distance_m"] / 1000.0
-                        text_line(f"Nearest hospital: {addr['hospital_name']} (~{km:.2f} km)", col=grey)
+                    # flagged steps table
+                    if detail["steps"]:
+                        df = pd.DataFrame(detail["steps"]).drop(columns=["_lat","_lon"])
+                        st.dataframe(df, use_container_width=True)
+                        csv = df.to_csv(index=False).encode()
+                        st.download_button("Download flagged steps (CSV)", data=csv, file_name="route_flags.csv", mime="text/csv")
                     else:
-                        text_line(f"Nearest hospital: {addr['hospital_name']}", col=grey)
+                        st.info("No flagged steps detected in the last 20 miles.")
 
-                # Map
-                if map_file and os.path.exists(map_file):
-                    try:
-                        ir = ImageReader(map_file)
-                        from PIL import Image as PILImage
-                        iw, ih = PILImage.open(map_file).size
-                        maxw, maxh = W - 2*M, 240
-                        sc = min(maxw/iw, maxh/ih)
-                        c.drawImage(ir, M, y - ih*sc, width=iw*sc, height=ih*sc)
-                        y -= ih*sc + 12
-                    except Exception:
-                        pass
-
-                # Key metrics
-                header("Key Metrics", size=13)
-                text_line(f"Wind: {ctx['wind']['speed_mps']:.1f} m/s from {ctx['wind']['compass']}", col=grey)
-                text_line(f"Slope: {ctx['slope_pct']:.1f}%   |   Approach avg/max: {ctx['approach_avg']:.1f}% / {ctx['approach_max']:.1f}%", col=grey)
-                rr_txt = ("n/a" if ctx.get("route_ratio") in (None, "", "n/a") else f"{ctx['route_ratio']:.2f}× crow-fly")
-                text_line(f"Route indirectness: {rr_txt}", col=grey)
-
-                # Vehicle
-                header("Vehicle", size=13)
-                text_line(f"Type: {ctx['vehicle']['type']}", col=grey)
-                text_line(f"Dimensions (L×W×H m): {ctx['vehicle']['length_m']:.1f} × {ctx['vehicle']['width_m']:.2f} × {ctx['vehicle']['height_m']:.2f}", col=grey)
-                text_line(f"Turning circle: {ctx['vehicle']['turning_circle_m']:.1f} m", col=grey)
-
-                # Separations
-                header("Separations (~400 m)", size=13)
-                feats = ctx["feats"]
-                sep_lines = [
-                    f"Building: {feats.get('building_m','n/a')}",
-                    f"Boundary: {feats.get('boundary_m','n/a')}",
-                    f"Road/footpath: {feats.get('road_m','n/a')}",
-                    f"Drain/manhole: {feats.get('drain_m','n/a')}",
-                    f"Overhead power lines: {feats.get('overhead_m','n/a')}",
-                    f"Railway: {feats.get('rail_m','n/a')}",
-                    f"Watercourse: {feats.get('water_m','n/a')}",
-                    f"Land use: {feats.get('land_class','n/a')}",
-                ]
-                for l in sep_lines: text_line(l)
-
-                # Risk
-                header("Risk score", size=13)
-                text_line(f"Total: {ctx['risk'].score:.1f}/100 → {ctx['risk'].status}", bold=True)
-                for p, m in ctx['risk'].explain[:7]:
-                    text_line(f"+{p} {m}")
-
-                # Controls
-                header("Recommended controls", size=13)
-                for b in ctx["controls"]:
-                    wrap_paragraph("• " + b)
-
-                # AI sections
-                for head in [
-                    "Safety Risk Profile",
-                    "Environmental Considerations",
-                    "Access & Logistics",
-                    "Overall Site Suitability",
-                ]:
-                    y -= 8
-                    header(head, size=13)
-                    wrap_paragraph(ai_text.get(head, ""))
-
-                c.showPage()
-                c.save()
-                return buf.getvalue()
-
-            ctx_pdf = {
-                "addr": addr_edited,
-                "wind": wind,
-                "slope_pct": slope_pct,
-                "approach_avg": approach_avg,
-                "approach_max": approach_max,
-                "route_ratio": route_ratio,
-                "feats": feats,
-                "risk": risk,
-                "vehicle": {
-                    "type": vehicle_type,
-                    "length_m": veh_length_m,
-                    "width_m": veh_width_m,
-                    "height_m": veh_height_m,
-                    "turning_circle_m": turning_circle_m,
-                },
-                "controls": controls_list,
-            }
-
-            pdf_bytes = build_pdf_bytes(ctx_pdf, ai, controls_list, map_path if MAPBOX_TOKEN else None)
-            if pdf_bytes:
-                st.download_button(
-                    "📄 Download PDF report",
-                    data=pdf_bytes,
-                    file_name=f"precheck_{st.session_state.get('w3w','site')}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
-            else:
-                st.caption("PDF generation unavailable on this host (ReportLab not installed).")
+                else:
+                    st.warning("Could not fetch detailed route data for this depot.")
