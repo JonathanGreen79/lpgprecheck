@@ -408,16 +408,15 @@ def osrm_route(lat1, lon1, lat2, lon2, overview=True, steps=True) -> Dict:
     return {}
 
 def quick_route_snapshot(dep: Dict, site_lat: float, site_lon: float) -> Dict:
-    """Return quick driving distance/ETA + approach info + lightweight flags."""
     out = {
         "miles": None,
         "eta_min": None,
         "final_road": None,
         "approach_deg": None,
         "approach_compass": None,
-        "winding": None,     # Low/Medium/High
-        "counts": {},        # parsed lightweight flags by keyword
-        "full_miles": None,  # entire route length miles
+        "winding": None,
+        "counts": {},
+        "full_miles": None,
     }
     if not dep:
         return out
@@ -435,7 +434,6 @@ def quick_route_snapshot(dep: Dict, site_lat: float, site_lon: float) -> Dict:
     out["miles"] = miles
     out["eta_min"] = eta_min
 
-    # Steps parsing
     steps = []
     legs = route.get("legs") or []
     if legs:
@@ -443,23 +441,18 @@ def quick_route_snapshot(dep: Dict, site_lat: float, site_lon: float) -> Dict:
             for stp in leg.get("steps", []):
                 steps.append(stp)
 
-    # Final approach
     if steps:
         last = steps[-1]
         out["final_road"] = (last.get("name") or "").strip() or None
 
-    # Approach bearing from last 2 coords
     coords = route.get("geometry", {}).get("coordinates") or []
     if len(coords) >= 2:
-        # OSRM coords are [lon, lat]
         a = (coords[-2][1], coords[-2][0])
         b = (coords[-1][1], coords[-1][0])
         br = _bearing_deg(a, b)
         out["approach_deg"] = round(br)
         out["approach_compass"] = _compass_from_deg(br)
 
-    # Last-mile winding score
-    # Walk back until ~1 mile and sum absolute heading changes
     if len(coords) >= 3:
         total = 0.0
         changes = 0.0
@@ -474,7 +467,7 @@ def quick_route_snapshot(dep: Dict, site_lat: float, site_lon: float) -> Dict:
                 d = abs((bear - last_bear + 180) % 360 - 180)
                 changes += d
             last_bear = bear
-            if total >= 1609.344:  # ~1 mile
+            if total >= 1609.344:
                 break
         if changes < 120:
             out["winding"] = "Low"
@@ -483,7 +476,6 @@ def quick_route_snapshot(dep: Dict, site_lat: float, site_lon: float) -> Dict:
         else:
             out["winding"] = "High"
 
-    # Lightweight flags via step text/name scanning
     keywords = {
         "barrier_gate": r"\b(gate|barrier)\b",
         "bollard": r"\b(bollard|bollards)\b",
@@ -626,7 +618,7 @@ def _offline_ai_sections(ctx: Dict) -> Dict[str, str]:
     )
     s2 = (
         f"Flood Low (No mapped watercourse nearby). Watercourse ~{feats.get('water_m','n/a')} m; "
-        f"drains/manholes {feats.get('drain_m','n/a')} m. Land use {land}. Vegetation within 3 m: level {veg}. "
+        f"drains/manholes {feats.get('drain_m','n/a')}. Land use {land}. Vegetation within 3 m: level {veg}. "
         f"{issues_line}"
     )
     s3 = (
@@ -647,9 +639,6 @@ def _offline_ai_sections(ctx: Dict) -> Dict[str, str]:
     }
 
 def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
-    """
-    Online AI that now also considers route snapshot/counts.
-    """
     if not OPENAI_API_KEY:
         raise RuntimeError("No OpenAI key")
 
@@ -730,9 +719,8 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
     except Exception as e:
         raise RuntimeError(f"OpenAI error: {e}")
 
-    # --- Robust parsing into 4 sections (same hardened parser)
     text = (content or "").replace("\r\n", "\n").strip()
-    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)  # drop bold markers
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
 
     section_keys = [
         "Safety Risk Profile",
@@ -778,7 +766,6 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
     return sections
 
 def ai_sections(ctx: Dict) -> Dict[str, str]:
-    """Try online; fallback to offline if key missing or error."""
     if OPENAI_API_KEY:
         try:
             return _online_ai_sections(ctx)
@@ -817,7 +804,6 @@ def nm_distance(
 
 # ------------------------- Pretty key/value block -------------------------
 def kv_block(title: str, data: Dict, cols: int = 2, fmt: Dict[str, str] | None = None):
-    """Pretty key/value block (inline compact)."""
     st.markdown(f"### {title}" if title.lower().startswith("key") else f"#### {title}")
     keys = list(data.keys())
     rows = (len(keys) + cols - 1) // cols
@@ -1079,7 +1065,6 @@ if auto:
             st.markdown("**Last-mile winding**")
             st.markdown("🌀 " + winding_badge(rs.get("winding")), unsafe_allow_html=True)
 
-        # Approach text line
         appr = []
         if rs.get("final_road"): appr.append(f"Final approach via **{rs['final_road']}**")
         if rs.get("approach_compass") is not None and rs.get("approach_deg") is not None:
@@ -1115,6 +1100,7 @@ if auto:
 
         submitted = st.form_submit_button("Confirm & assess", type="primary", key="confirm_btn")
 
+    # ---------------- Confirm handler (with status queue) ----------------
     if submitted:
         feats = {
             "building_m": building_m, "road_m": road_m, "drain_m": drain_m,
@@ -1124,11 +1110,37 @@ if auto:
         wind = {"speed_mps": wind_mps, "deg": wind_deg,
                 "compass": ["N","NE","E","SE","S","SW","W","NW"][round((wind_deg%360)/45)%8]}
 
-        risk = risk_score(
-            feats=feats, wind=wind, slope_pct=slope_pct,
-            enclosure_sides=enclosure_sides, los_issue=los_issue,
-            veg_3m=veg_3m, open_field_m=open_field_m
-        )
+        # Run heavy work first with a visible status panel
+        with st.status("Assessing site…", expanded=True) as stat:
+            stat.write("1/3 Scoring risk…")
+            risk = risk_score(
+                feats=feats, wind=wind, slope_pct=slope_pct,
+                enclosure_sides=enclosure_sides, los_issue=los_issue,
+                veg_3m=veg_3m, open_field_m=open_field_m
+            )
+
+            stat.update(label="Assessing site… • 2/3 Generating AI commentary…")
+            ctx_for_ai = {
+                "feats": feats, "wind": wind, "slope_pct": slope_pct,
+                "enclosure_sides": enclosure_sides, "los_issue": los_issue,
+                "veg_3m": veg_3m, "risk": risk,
+                "route": (auto.get("route_snap") or {}),
+            }
+            ai = ai_sections(ctx_for_ai)
+
+            stat.update(label="Assessing site… • 3/3 Preparing map & export…")
+            # Prepare a static map once and reuse
+            map_path = None
+            if MAPBOX_TOKEN:
+                img_for_export = fetch_map(st.session_state["auto"]["lat"], st.session_state["auto"]["lon"])
+                if img_for_export:
+                    try:
+                        map_path = "map_preview.png"
+                        img_for_export.save(map_path)
+                    except Exception:
+                        map_path = None
+
+            stat.update(label="Assessment complete ✅", state="complete")
 
         addr_edited = {
             "road": addr_road, "city": addr_city, "postcode": addr_postcode,
@@ -1194,21 +1206,15 @@ if auto:
             for p, m in risk.explain[:6]:
                 st.write(f"+{p} {m}")
 
-            if MAPBOX_TOKEN:
+            if MAPBOX_TOKEN and map_path and os.path.exists(map_path):
                 st.markdown("#### Map")
-                img = fetch_map(st.session_state["auto"]["lat"], st.session_state["auto"]["lon"])
-                if img:
-                    st.image(img, caption="Map (centered on W3W)", use_container_width=True)
+                try:
+                    st.image(map_path, caption="Map (centered on W3W)", use_container_width=True)
+                except Exception:
+                    pass
 
         with right:
             st.markdown("### AI commentary")
-            ctx = {
-                "feats": feats, "wind": wind, "slope_pct": slope_pct,
-                "enclosure_sides": enclosure_sides, "los_issue": los_issue,
-                "veg_3m": veg_3m, "risk": risk,
-                "route": (auto.get("route_snap") or {}),
-            }
-            ai = ai_sections(ctx)
             sections = [
                 "Safety Risk Profile",
                 "Environmental Considerations",
@@ -1229,7 +1235,6 @@ if auto:
                 controls_list.append("Ensure firm, level stand surface (temporary mats if required).")
             if overhead_m is not None and overhead_m < CoP["overhead_info_m"]:
                 controls_list.append("Confirm isolation/clearance for overhead power; position tanker outside bands.")
-            # Light tunnel hint based on quick analysis:
             if (auto.get("route_snap", {}).get("counts", {}).get("tunnel", 0) or 0) > 0:
                 controls_list.append("⚠️ LPG tankers: tunnels/underpasses noted on approach — plan a compliant diversion.")
             for b in controls_list:
@@ -1248,7 +1253,6 @@ if auto:
             full = rs.get("full_miles")
             st.caption(f"Full route: {full if full is not None else 'n/a'} miles • Analysed segment: ~last 20 miles (nearest to site)")
 
-            # Counts panel (always show)
             counts = rs.get("counts") or {}
             pretty = {
                 "Gates/barriers": counts.get("barrier_gate", 0),
@@ -1262,7 +1266,6 @@ if auto:
                 "Private / No through": counts.get("private", 0),
                 "Construction/closures": counts.get("construction", 0),
             }
-            # badge colour
             def badge(v:int)->str:
                 if v <= 0: col="#289e41"
                 elif v==1: col="#e0a10b"
@@ -1282,16 +1285,6 @@ if auto:
             st.markdown("---")
             st.subheader("Export")
             st.caption("Generate a one-page PDF summary (includes key metrics, separations, vehicle, AI commentary, controls, and map if available).")
-
-            map_path = None
-            if MAPBOX_TOKEN:
-                img = fetch_map(st.session_state["auto"]["lat"], st.session_state["auto"]["lon"])
-                if img:
-                    map_path = "map_preview.png"
-                    try:
-                        img.save(map_path)
-                    except Exception:
-                        map_path = None
 
             def build_pdf_bytes(ctx: Dict, ai_text: Dict[str,str], controls: list, map_file: Optional[str]) -> bytes:
                 try:
@@ -1436,7 +1429,7 @@ if auto:
                 "controls": controls_list,
             }
 
-            pdf_bytes = build_pdf_bytes(ctx_pdf, ai, controls_list, map_path)
+            pdf_bytes = build_pdf_bytes(ctx_pdf, ai, controls_list, map_path if MAPBOX_TOKEN else None)
             if pdf_bytes:
                 st.download_button(
                     "📄 Download PDF report",
