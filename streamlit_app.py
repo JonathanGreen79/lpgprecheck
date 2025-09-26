@@ -85,7 +85,7 @@ VEHICLE_PRESETS = {
     "LPG Tanker (Long Rigid)":{"length_m": 11.0, "width_m": 2.5, "height_m": 3.7, "turning_circle_m": 21.0},
 }
 
-# ------------------------- Depots (from your list) -------------------------
+# ------------------------- Depots (your list) -------------------------
 DEPOTS = [
     {"name": "Blaydon",       "lat": 54.9756187, "lon": -1.744101},
     {"name": "Buckfastleigh", "lat": 50.4869034, "lon": -3.7833235},
@@ -170,6 +170,13 @@ def nearest_depot(lat: float, lon: float) -> Dict[str, Optional[float]]:
         if best is None or miles < best["miles"]:
             best = {"name": d["name"], "miles": miles, "lat": d["lat"], "lon": d["lon"]}
     return best or {"name": "n/a", "miles": None, "lat": None, "lon": None}
+
+def nearest_depots(lat: float, lon: float, n: int = 3) -> List[Dict[str, float]]:
+    ranked = []
+    for d in DEPOTS:
+        ranked.append({"name": d["name"], "miles": haversine_miles(lat, lon, d["lat"], d["lon"])})
+    ranked.sort(key=lambda x: x["miles"])
+    return ranked[:n]
 
 # ------------------------- External data -------------------------
 def w3w_to_latlon(words: str) -> Tuple[Optional[float], Optional[float]]:
@@ -353,6 +360,9 @@ def parse_osm(lat0, lon0, data) -> Dict:
     over_candidates = [dist_line(lat0, lon0, l) for l in plines]
     if pnodes:
         pn = min(_dist_m(lat0, lon0, la, lo) for la,lo in pnodes)
+    else:
+        pn = None
+    if pn is not None:
         over_candidates.append(pn)
     d_over = _min_clean(over_candidates)
 
@@ -512,11 +522,6 @@ def _offline_ai_sections(ctx: Dict) -> Dict[str, str]:
     }
 
 def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
-    """
-    Call OpenAI for commentary and robustly parse output into four sections.
-    Safer parser: only treats headings at line-start as headings; inline headings
-    are only recognized if followed by ':' or a dash.
-    """
     if not OPENAI_API_KEY:
         raise RuntimeError("No OpenAI key")
 
@@ -564,7 +569,6 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
         f"Context:\n{json.dumps(site, ensure_ascii=False)}"
     )
 
-    # --- Call OpenAI
     try:
         r = requests.post(
             "https://api.openai.com/v1/chat/completions",
@@ -588,9 +592,8 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
     except Exception as e:
         raise RuntimeError(f"OpenAI error: {e}")
 
-    # --- Robust parsing into 4 sections
     text = (content or "").replace("\r\n", "\n").strip()
-    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)  # drop bold markers
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
 
     section_keys = [
         "Safety Risk Profile",
@@ -600,7 +603,6 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
     ]
     sections = {k: "" for k in section_keys}
 
-    # Primary pass: headings MUST be at start of line (markdown ### / bold allowed, optional colon)
     head_line_re = re.compile(
         r"(?im)^\s*(?:#+\s*)?(?:\*\*)?(Safety Risk Profile|Environmental Considerations|Access & Logistics|Overall Site Suitability)(?:\*\*)?\s*:?\s*"
     )
@@ -620,8 +622,6 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
 
     found = slice_by_matches(text)
 
-    # Fallback pass: if fewer than 2 sections were found, try inline headings BUT
-    # ONLY when followed by ':' or a dash to avoid matching phrases like "safety risk profile is ..."
     if sum(bool(v) for v in found.values()) < 2:
         inline = text
         for k in section_keys:
@@ -640,7 +640,6 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
     return sections
 
 def ai_sections(ctx: Dict) -> Dict[str, str]:
-    """Try online; fallback to offline if key missing or error."""
     if OPENAI_API_KEY:
         try:
             return _online_ai_sections(ctx)
@@ -679,7 +678,6 @@ def nm_distance(
 
 # ------------------------- Pretty key/value block -------------------------
 def kv_block(title: str, data: Dict, cols: int = 2, fmt: Dict[str, str] | None = None):
-    """Pretty key/value block (inline compact)."""
     st.markdown(f"### {title}" if title.lower().startswith("key") else f"#### {title}")
     keys = list(data.keys())
     rows = (len(keys) + cols - 1) // cols
@@ -774,13 +772,15 @@ if run:
             osm  = overpass_near(lat, lon, radius=400)
             feats = parse_osm(lat, lon, osm)
             hosp = nearest_hospital(lat, lon)
-            depot = nearest_depot(lat, lon)
+            depot1 = nearest_depot(lat, lon)
+            depots3 = nearest_depots(lat, lon, n=3)
 
             st.session_state["auto"] = {
                 "lat": lat, "lon": lon,
                 "addr": addr,
                 "hospital": hosp,
-                "nearest_depot": depot,  # <- store for immediate display
+                "nearest_depot": depot1,     # for the read-only fields
+                "nearest_depots": depots3,   # for the top-3 table
                 "wind_mps": wind.get("speed_mps") or 0.0,
                 "wind_deg": wind.get("deg") or 0,
                 "wind_comp": wind.get("compass") or "n/a",
@@ -890,7 +890,7 @@ if auto:
         st.session_state[f"{basekey}_height_m"] = veh_height_m
         st.session_state[f"{basekey}_turning_circle_m"] = turning_circle_m
 
-        # ---------------- Nearest Depot & Logistics (NEW) ----------------
+        # ---------------- Nearest Depot & Logistics (Top 3) ----------------
         st.markdown("---")
         st.subheader("Nearest Depot & Logistics")
         nd = auto.get("nearest_depot") or nearest_depot(auto["lat"], auto["lon"])
@@ -901,6 +901,13 @@ if auto:
             st.text_input("Nearest depot", nd_name, disabled=True, key="nearest_depot_name_ro")
         with cnd2:
             st.text_input("Distance (miles)", nd_miles, disabled=True, key="nearest_depot_dist_ro")
+
+        depots3 = auto.get("nearest_depots") or nearest_depots(auto["lat"], auto["lon"], n=3)
+        st.caption("Top 3 nearest depots (crow-fly)")
+        st.table(
+            {"Depot": [d["name"] for d in depots3],
+             "Distance (miles)": [round(d["miles"], 1) for d in depots3]}
+        )
 
         st.markdown("---")
         st.subheader("Site options")
