@@ -916,7 +916,7 @@ def build_pdf_report(ctx: Dict) -> bytes:
         return None
 
     def _kv_table(d: Dict, ncols=2):
-        # Flatten into rows of key/value; auto split into ncols*2 table
+        """Return a single Table with ncols key/value pairs per row."""
         items = list(d.items())
         rows = []
         for i in range(0, len(items), ncols):
@@ -925,15 +925,19 @@ def build_pdf_report(ctx: Dict) -> bytes:
             for k, v in slice_items:
                 row.append(Paragraph(f"<b>{k}:</b>", styleN))
                 row.append(str(v if v not in (None, "") else "—"))
-            while len(row) < ncols*2:
+            # pad last row if short
+            while len(row) < ncols * 2:
                 row.append("")
-            t = Table(row, colWidths=[35*mm, 55*mm]*ncols, hAlign="LEFT")
-            t.setStyle(TableStyle([
-                ("VALIGN", (0,0), (-1,-1), "TOP"),
-                ("TEXTCOLOR", (0,0), (-1,-1), colors.black),
-                ("BOTTOMPADDING", (0,0), (-1,-1), 4),
-            ]))
-            rows.append(t)
+            rows.append(row)
+    
+        t = Table(rows, colWidths=[35*mm, 55*mm] * ncols, hAlign="LEFT")
+        t.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        return t
+
         # rows is a list of small 1-row tables to get nice vertical spacing
         flow = []
         for r in rows:
@@ -1044,19 +1048,19 @@ def build_pdf_report(ctx: Dict) -> bytes:
         story += [tank_im, Spacer(1, 3*mm)]
 
     # ---------- KEY METRICS ----------
-    story += [_title("Key metrics")]
-    story += _kv_table(ctx.get("key_metrics", {}))
-    story += [Spacer(1, 3*mm)]
+    story apend [_title("Key metrics")]
+    story apend _kv_table(ctx.get("key_metrics", {}))
+    story apend [Spacer(1, 3*mm)]
 
     # ---------- SEPARATIONS ----------
-    story += [_title("Separations (~400 m)")]
-    story += _kv_table(ctx.get("separations", {}))
-    story += [Spacer(1, 3*mm)]
+    story apend [_title("Separations (~400 m)")]
+    story apend _kv_table(ctx.get("separations", {}))
+    story apend [Spacer(1, 3*mm)]
 
     # ---------- VEHICLE ----------
-    story += [_title("Vehicle")]
-    story += _kv_table(ctx.get("vehicle", {}))
-    story += [Spacer(1, 3*mm)]
+    story apend [_title("Vehicle")]
+    story apend _kv_table(ctx.get("vehicle", {}))
+    story apend [Spacer(1, 3*mm)]
 
     # ---------- NEAREST DEPOTS ----------
     dep3 = ctx.get("nearest_depots") or []
@@ -1998,6 +2002,7 @@ if auto:
                         )
                     else:
                         st.info("No vehicle-specific conflicts detected in the analysed segment.")
+
 
 
 
