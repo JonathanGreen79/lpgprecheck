@@ -1,5 +1,4 @@
-# streamlit_app.py
-import os, io, math, json, requests
+import os, io, math, json, requests, re
 from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass
 
@@ -210,7 +209,6 @@ out tags geom;
     except Exception:
         return {"elements": []}
 
-# ---- Nearest hospital with escalating radius
 def nearest_hospital(lat: float, lon: float) -> Dict:
     """Return nearest hospital-like feature up to 10 km."""
     radii = [400, 1000, 3000, 10000]
@@ -463,6 +461,10 @@ def _offline_ai_sections(ctx: Dict) -> Dict[str, str]:
     }
 
 def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
+    """
+    Call OpenAI for commentary and robustly parse output into four sections.
+    Falls back to raising RuntimeError on API issues (caught by ai_sections()).
+    """
     if not OPENAI_API_KEY:
         raise RuntimeError("No OpenAI key")
 
@@ -470,6 +472,7 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
     feats = ctx.get("feats", {})
     wind = ctx.get("wind", {})
     risk = ctx.get("risk")
+
     site = {
         "wind": {"mps": wind.get("speed_mps"), "dir_deg": wind.get("deg"), "dir_compass": wind.get("compass")},
         "slope_pct": ctx.get("slope_pct"),
@@ -492,11 +495,17 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
             "drivers": getattr(risk, "explain", []),
         },
     }
+
+    # Stronger formatting instructions: each heading on its own line followed by one paragraph
     system = (
         "You are a safety and logistics assistant writing concise LPG site pre-check commentary. "
         "Audience is field engineers; keep it professional, UK terminology. "
-        "Output exactly four sections as plain text paragraphs with these headings: "
-        "Safety Risk Profile; Environmental Considerations; Access & Logistics; Overall Site Suitability."
+        "Output exactly four sections with these exact headings, and put EACH heading on its own line, "
+        "followed by a single paragraph of text. No lists.\n"
+        "### Safety Risk Profile\n"
+        "### Environmental Considerations\n"
+        "### Access & Logistics\n"
+        "### Overall Site Suitability"
     )
     user = (
         "Using this site context, write those four sections (short, specific, actionable). "
@@ -504,6 +513,7 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
         f"Context:\n{json.dumps(site, ensure_ascii=False)}"
     )
 
+    # --- Call OpenAI
     try:
         r = requests.post(
             "https://api.openai.com/v1/chat/completions",
@@ -527,35 +537,61 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
     except Exception as e:
         raise RuntimeError(f"OpenAI error: {e}")
 
+    # --- Robust parsing into 4 sections
     sections = {
         "Safety Risk Profile": "",
         "Environmental Considerations": "",
         "Access & Logistics": "",
         "Overall Site Suitability": "",
     }
-    text = content.replace("\r\n", "\n")
-    anchors = [
-        ("Safety Risk Profile", "Safety Risk Profile"),
-        ("Environmental Considerations", "Environmental Considerations"),
-        ("Access & Logistics", "Access & Logistics"),
-        ("Overall Site Suitability", "Overall Site Suitability"),
+
+    text = (content or "").replace("\r\n", "\n").strip()
+
+    # Normalise common formats: remove bold markers and trailing colons after headings
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+
+    heads = [
+        "Safety Risk Profile",
+        "Environmental Considerations",
+        "Access & Logistics",
+        "Overall Site Suitability",
     ]
-    current = None
-    for line in text.split("\n"):
-        l = line.strip().lstrip("#").strip()
-        if not l:
-            continue
-        found = False
-        for key, anchor in anchors:
-            if l.lower().startswith(anchor.lower()):
-                current = key
-                found = True
-                break
-        if found:
-            continue
-        if current is None:
-            current = "Safety Risk Profile"
-        sections[current] += (("" if sections[current] == "" else " ") + l)
+
+    # Regex that matches our headings at start-of-line with optional markdown hashes and optional colon
+    head_re = r"(?:^|\n)\s*(?:#+\s*)?(%s)\s*:?" % "|".join(map(re.escape, heads))
+    pattern = re.compile(head_re, re.IGNORECASE)
+
+    # If headings appear mid-line, insert a newline before them so the splitter works
+    def _newline_before_headings(t: str) -> str:
+        for h in heads:
+            t = re.sub(rf"(?<!\n)\s+({re.escape(h)})\s*:?", r"\n\1:", t, flags=re.IGNORECASE)
+        return t
+
+    text = _newline_before_headings(text)
+
+    # Split by headings and capture them
+    parts = pattern.split(text)
+    # parts looks like: [pre, H1, body1, H2, body2, H3, body3, H4, body4, post]
+
+    if len(parts) >= 3:
+        # Walk pairs of (heading, body)
+        for i in range(1, len(parts), 2):
+            heading = (parts[i] or "").strip()
+            body = parts[i + 1] if i + 1 < len(parts) else ""
+            # Trim any further headings that might have leaked into this body
+            body = (pattern.split(body)[0] or "").strip()
+            # Normalise heading capitalisation to our keys
+            for k in sections.keys():
+                if heading.lower() == k.lower():
+                    sections[k] = body
+                    break
+    else:
+        # Fallback: if nothing matched, put everything in first section
+        sections["Safety Risk Profile"] = text
+
+    # Final tidy: ensure each section has some content
+    for k, v in list(sections.items()):
+        sections[k] = v.strip() or "No additional notes for this section."
 
     return sections
 
