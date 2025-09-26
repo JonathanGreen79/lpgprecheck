@@ -1618,6 +1618,20 @@ if auto:
                             get_radius=60,
                             pickable=True,
                         )
+
+                        # Compute a sensible map center/zoom
+                        coords = detail["path"] or []
+                        if coords:
+                            # path is [lon, lat] pairs
+                            lats = [c[1] for c in coords]
+                            lons = [c[0] for c in coords]
+                            ctr_lat = (min(lats) + max(lats)) / 2
+                            ctr_lon = (min(lons) + max(lons)) / 2
+                            view_state = pdk.ViewState(latitude=ctr_lat, longitude=ctr_lon, zoom=10.5)
+                        else:
+                            # fallback to site location
+                            view_state = pdk.ViewState(latitude=auto["lat"], longitude=auto["lon"], zoom=11)
+
                         st.pydeck_chart(
                             pdk.Deck(
                                 layers=[path_layer, flag_layer],
@@ -1647,6 +1661,7 @@ if auto:
                         )
                     else:
                         st.info("No vehicle-specific conflicts detected in the analysed segment.")
+
 
 
 
