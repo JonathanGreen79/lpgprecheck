@@ -889,20 +889,24 @@ def build_pdf_report(ctx: Dict) -> bytes:
     """
     try:
         # ReportLab (Platypus)
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+        )
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib import colors
         from reportlab.lib.units import mm
+        from reportlab.pdfgen import canvas as rl_canvas
+        import datetime
     except Exception:
         return b""
 
     # ---------- helpers ----------
     def _img(path, max_w=170*mm, max_h=40*mm):
+        """Image with max size (keeps aspect)."""
         try:
             if path and os.path.exists(path):
                 im = Image(path)
-                # scale keeping aspect
                 iw, ih = im.wrap(0, 0)
                 sc = min(max_w/iw, max_h/ih)
                 im._restrictSize(iw*sc, ih*sc)
@@ -914,7 +918,6 @@ def build_pdf_report(ctx: Dict) -> bytes:
     def _kv_table(d: Dict, ncols=2):
         # Flatten into rows of key/value; auto split into ncols*2 table
         items = list(d.items())
-        # chunk into rows for ncols
         rows = []
         for i in range(0, len(items), ncols):
             slice_items = items[i:i+ncols]
@@ -922,17 +925,20 @@ def build_pdf_report(ctx: Dict) -> bytes:
             for k, v in slice_items:
                 row.append(Paragraph(f"<b>{k}:</b>", styleN))
                 row.append(str(v if v not in (None, "") else "—"))
-            # pad if last row short
             while len(row) < ncols*2:
                 row.append("")
-            rows.append(row)
-        t = Table(rows, colWidths=[35*mm, 55*mm]*ncols, hAlign="LEFT")
-        t.setStyle(TableStyle([
-            ("VALIGN", (0,0), (-1,-1), "TOP"),
-            ("TEXTCOLOR", (0,0), (-1,-1), colors.black),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 4),
-        ]))
-        return t
+            t = Table(row, colWidths=[35*mm, 55*mm]*ncols, hAlign="LEFT")
+            t.setStyle(TableStyle([
+                ("VALIGN", (0,0), (-1,-1), "TOP"),
+                ("TEXTCOLOR", (0,0), (-1,-1), colors.black),
+                ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+            ]))
+            rows.append(t)
+        # rows is a list of small 1-row tables to get nice vertical spacing
+        flow = []
+        for r in rows:
+            flow.append(r)
+        return flow
 
     def _title(txt): return Paragraph(f"<para spaceb=6><b>{txt}</b></para>", styleH)
     def _caption(txt): return Paragraph(f"<font size=9 color='#666666'>{txt}</font>", styleN)
@@ -944,7 +950,38 @@ def build_pdf_report(ctx: Dict) -> bytes:
     styleH = ParagraphStyle("H", parent=styles["Heading2"], spaceBefore=6, spaceAfter=6)
     styleH.fontSize = 12
     styleH.leading = 14
-    styleT = ParagraphStyle("T", parent=styles["Title"], fontSize=16, leading=18)
+    styleT = ParagraphStyle("T", parent=styles["Title"], fontSize=16, leading=18, alignment=0)  # left
+
+    # ---------- footer canvas (page X of Y + created date) ----------
+    class NumberedCanvas(rl_canvas.Canvas):
+        def __init__(self, *args, created_str="", **kwargs):
+            super().__init__(*args, **kwargs)
+            self._saved_page_states = []
+            self.created_str = created_str
+
+        def showPage(self):
+            self._saved_page_states.append(dict(self.__dict__))
+            super().showPage()
+
+        def save(self):
+            page_count = len(self._saved_page_states)
+            for state in self._saved_page_states:
+                self.__dict__.update(state)
+                self._draw_footer(page_count)
+                super().showPage()
+            super().save()
+
+        def _draw_footer(self, page_count):
+            w, h = A4
+            left_margin = 16*mm
+            right_margin = w - 16*mm
+            self.setFont("Helvetica", 9)
+            # left: created timestamp
+            self.drawString(left_margin, 10*mm, f"Created: {self.created_str}")
+            # right: page number
+            self.drawRightString(right_margin, 10*mm, f"Page {self._pageNumber} of {page_count}")
+
+    created_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
     # ---------- doc ----------
     buf = io.BytesIO()
@@ -956,24 +993,44 @@ def build_pdf_report(ctx: Dict) -> bytes:
     )
     story = []
 
-    # ---------- header row (logo + title + tank image) ----------
-    logo_im = _img(ctx.get("logo_file"))
-    tank_im = _img(ctx.get("tank_file"), max_w=60*mm, max_h=25*mm)
+    # ---------- header (TITLE LEFT, LOGO RIGHT) ----------
+    # logo scaled to ~256 px wide ≈ 256 pt ≈ 90.3 mm
+    logo_w = 256  # points
+    logo_im = None
+    try:
+        logo_path = ctx.get("logo_file")
+        if logo_path and os.path.exists(logo_path):
+            logo_im = Image(logo_path, width=logo_w, height=logo_w * 0.4)  # assume landscape logo; tweak as needed
+    except Exception:
+        logo_im = None
 
-    title_txt = f"LPG Customer Tank — Pre-Check"
+    # optional small tank image (we keep but move below header, right-aligned)
+    tank_im = _img(ctx.get("tank_file"), max_w=60*mm, max_h=25*mm)
+    if tank_im:
+        tank_im.hAlign = "RIGHT"
+
+    title_txt = "LPG Customer Tank — Pre-Check"
     w3w = ctx.get("w3w") or ""
     sub_txt = f"///{w3w}" if w3w else ""
 
     title_block = [Paragraph(title_txt, styleT)]
-    if sub_txt: title_block.append(Paragraph(sub_txt, styleN))
+    if sub_txt:
+        title_block.append(Paragraph(sub_txt, styleN))
 
-    # 3-column header
-    header_cells = [[logo_im or "", title_block, tank_im or ""]]
-    header_tbl = Table(header_cells, colWidths=[45*mm, None, 45*mm])
-    header_tbl.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
+    # Two-column header: title left (auto width), logo right (fixed width)
+    header_tbl = Table(
+        [[title_block, logo_im or ""]],
+        colWidths=[None, 90.3*mm],
+        hAlign="LEFT"
+    )
+    header_tbl.setStyle(TableStyle([
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("ALIGN",  (1,0), (1,0), "RIGHT"),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+    ]))
     story += [header_tbl, Spacer(1, 6*mm)]
 
-    # address
+    # address (under the TITLE area, left aligned)
     addr = ctx.get("addr") or {}
     addr_line = ", ".join([p for p in [addr.get("road"), addr.get("city"), addr.get("postcode")] if p])
     if addr_line:
@@ -982,14 +1039,24 @@ def build_pdf_report(ctx: Dict) -> bytes:
         story += [_caption(addr.get("display_name"))]
     story += [Spacer(1, 3*mm)]
 
+    # show small tank image under header, right-aligned (optional)
+    if tank_im:
+        story += [tank_im, Spacer(1, 3*mm)]
+
     # ---------- KEY METRICS ----------
-    story += [_title("Key metrics"), _kv_table(ctx.get("key_metrics", {})), Spacer(1, 3*mm)]
+    story += [_title("Key metrics")]
+    story += _kv_table(ctx.get("key_metrics", {}))
+    story += [Spacer(1, 3*mm)]
 
     # ---------- SEPARATIONS ----------
-    story += [_title("Separations (~400 m)"), _kv_table(ctx.get("separations", {})), Spacer(1, 3*mm)]
+    story += [_title("Separations (~400 m)")]
+    story += _kv_table(ctx.get("separations", {}))
+    story += [Spacer(1, 3*mm)]
 
     # ---------- VEHICLE ----------
-    story += [_title("Vehicle"), _kv_table(ctx.get("vehicle", {})), Spacer(1, 3*mm)]
+    story += [_title("Vehicle")]
+    story += _kv_table(ctx.get("vehicle", {}))
+    story += [Spacer(1, 3*mm)]
 
     # ---------- NEAREST DEPOTS ----------
     dep3 = ctx.get("nearest_depots") or []
@@ -1057,8 +1124,12 @@ def build_pdf_report(ctx: Dict) -> bytes:
         story += [t]
 
     # ---------- build ----------
-    doc.build(story)
+    doc.build(
+        story,
+        canvasmaker=lambda *args, **kw: NumberedCanvas(*args, created_str=created_str, **kw),
+    )
     return buf.getvalue()
+
         
 
 # ------------------------- AI commentary (ONLINE by default, OFFLINE fallback) -------------------------
@@ -1927,6 +1998,7 @@ if auto:
                         )
                     else:
                         st.info("No vehicle-specific conflicts detected in the analysed segment.")
+
 
 
 
