@@ -623,7 +623,7 @@ def detailed_route_analysis(
     veh_w = (vehicle or {}).get("width_m")
     veh_mass = (vehicle or {}).get("mass_t")   # optional; may be None
     veh_turn = (vehicle or {}).get("turning_circle_m")
-    from here
+     
     conflicts = []   # rows to display
     flag_points = [] # map pins (now always include, colour-coded)
     disp_rows = []   # full (flagged) rows for table/CSV
@@ -1647,5 +1647,6 @@ if auto:
                         )
                     else:
                         st.info("No vehicle-specific conflicts detected in the analysed segment.")
+
 
 
