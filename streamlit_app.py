@@ -1852,6 +1852,29 @@ if auto:
                 # --- PDF: gather context and offer download ---
                 logo_file = COMPANY_LOGO if os.path.exists(COMPANY_LOGO) else None
                 tank_file = "tank.png" if os.path.exists("tank.png") else None  # optional tank illustration
+
+                # --- Build route snapshot + concerns for PDF (nearest depot, cached) ---
+                route_img_for_pdf = None
+                route_flags_for_pdf = []
+                try:
+                    dep_choice_pdf = (auto.get("nearest_depots") or [{}])[0].get("name")
+                    if dep_choice_pdf:
+                        veh_payload_pdf = {
+                            "height_m": veh_height_m,
+                            "width_m": veh_width_m,
+                            "turning_circle_m": turning_circle_m,
+                            "length_m": veh_length_m,
+                            "mass_t": None,
+                        }
+                        detail_for_pdf = detailed_route_analysis(
+                            dep_choice_pdf, auto["lat"], auto["lon"], last_miles=20.0, vehicle=veh_payload_pdf
+                        )
+                        if detail_for_pdf.get("path"):
+                            route_img_for_pdf = render_route_image(detail_for_pdf["path"], auto["lat"], auto["lon"])
+                        # steps already filtered to flagged/advisory rows in your analyzer
+                        route_flags_for_pdf = detail_for_pdf.get("steps", [])
+                except Exception:
+                    pass
                 
                 pdf_ctx = {
                     "w3w": st.session_state.get("w3w",""),
@@ -1894,31 +1917,7 @@ if auto:
                     "route_image_file": route_img_for_pdf,     # <— new
                     "route_flags": route_flags_for_pdf,        # <— new (list of dict rows)
                 }
-
-                # --- Build route snapshot + concerns for PDF (nearest depot, cached) ---
-                route_img_for_pdf = None
-                route_flags_for_pdf = []
-                try:
-                    dep_choice_pdf = (auto.get("nearest_depots") or [{}])[0].get("name")
-                    if dep_choice_pdf:
-                        veh_payload_pdf = {
-                            "height_m": veh_height_m,
-                            "width_m": veh_width_m,
-                            "turning_circle_m": turning_circle_m,
-                            "length_m": veh_length_m,
-                            "mass_t": None,
-                        }
-                        detail_for_pdf = detailed_route_analysis(
-                            dep_choice_pdf, auto["lat"], auto["lon"], last_miles=20.0, vehicle=veh_payload_pdf
-                        )
-                        if detail_for_pdf.get("path"):
-                            route_img_for_pdf = render_route_image(detail_for_pdf["path"], auto["lat"], auto["lon"])
-                        # steps already filtered to flagged/advisory rows in your analyzer
-                        route_flags_for_pdf = detail_for_pdf.get("steps", [])
-                except Exception:
-                    pass
-
-                
+              
                 pdf_bytes2 = build_pdf_report(pdf_ctx)
                 if pdf_bytes2:
                     st.download_button(
@@ -2108,6 +2107,7 @@ if auto:
                         )
                     else:
                         st.info("No vehicle-specific conflicts detected in the analysed segment.")
+
 
 
 
