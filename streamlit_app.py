@@ -874,6 +874,35 @@ def fetch_map(lat, lon, zoom=17, size=(1000, 700)) -> Optional[Image.Image]:
     except Exception:
         return None
 
+# --- Simple route snapshot renderer (PNG) ---
+def render_route_image(path_coords, site_lat, site_lon, out_path="route_preview.png"):
+    """
+    Render a minimal route snapshot to a PNG using lon/lat path_coords
+    (as returned by detailed_route_analysis['path']). Returns file path or None.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # headless
+        import matplotlib.pyplot as plt
+
+        if not path_coords:
+            return None
+
+        lons = [p[0] for p in path_coords]
+        lats = [p[1] for p in path_coords]
+
+        plt.figure(figsize=(6.7, 4.2), dpi=150)
+        plt.plot(lons, lats, linewidth=2)              # route
+        plt.scatter([lons[-1]], [lats[-1]], s=24)      # site marker (end)
+        plt.axis("off")
+        plt.tight_layout(pad=0)
+        plt.savefig(out_path, bbox_inches="tight", pad_inches=0)
+        plt.close()
+        return out_path
+    except Exception:
+        return None
+
+
 # ---------- NICE MULTI-PAGE PDF (Platypus) ----------
 def build_pdf_report(ctx: Dict) -> bytes:
     """
@@ -1130,6 +1159,37 @@ def build_pdf_report(ctx: Dict) -> bytes:
     if mp:
         story += [_title("Map (centered on W3W)"), mp, Spacer(1, 3*mm)]
 
+    # ---------- ROUTE SNAPSHOT (image) ----------
+    rimg = _img(ctx.get("route_image_file"), max_w=178*mm, max_h=120*mm)
+    if rimg:
+        story += [_title("Route snapshot (nearest depot)"), rimg, Spacer(1, 3*mm)]
+
+    # ---------- VEHICLE-SPECIFIC CONCERNS (table) ----------
+    concerns = ctx.get("route_flags") or []
+    if concerns:
+        story += [_title("Vehicle-specific concerns (last ~20 miles)")]
+        rows = [["Distance to site (mi)", "Road", "Restriction", "Verdict"]]
+        for r in concerns:
+            rows.append([
+                f"{r.get('Distance to site (mi)', '')}",
+                r.get("Road", "") or "—",
+                r.get("Restriction", "") or "—",
+                r.get("Verdict", "") or "—",
+            ])
+        tc = Table(
+            rows,
+            colWidths=[28*mm, 45*mm, 85*mm, 20*mm],
+            hAlign="LEFT",
+        )
+        tc.setStyle(TableStyle([
+            ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
+            ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
+            ("VALIGN", (0,0), (-1,-1), "TOP"),
+            ("ALIGN", (0,0), (0,-1), "RIGHT"),   # distance right-aligned
+        ]))
+        story += [tc, Spacer(1, 3*mm)]
+
+    
     # ---------- ROUTE COUNTS ----------
     rc = ctx.get("route_counts") or {}
     if rc:
@@ -1831,7 +1891,33 @@ if auto:
                     "ai": ai,                                 # four commentary sections
                     "controls": controls_list,                 # <- now defined
                     "route_counts": (auto.get("route_snap") or {}).get("counts", {}) or {},
+                    "route_image_file": route_img_for_pdf,     # <— new
+                    "route_flags": route_flags_for_pdf,        # <— new (list of dict rows)
                 }
+
+                # --- Build route snapshot + concerns for PDF (nearest depot, cached) ---
+                route_img_for_pdf = None
+                route_flags_for_pdf = []
+                try:
+                    dep_choice_pdf = (auto.get("nearest_depots") or [{}])[0].get("name")
+                    if dep_choice_pdf:
+                        veh_payload_pdf = {
+                            "height_m": veh_height_m,
+                            "width_m": veh_width_m,
+                            "turning_circle_m": turning_circle_m,
+                            "length_m": veh_length_m,
+                            "mass_t": None,
+                        }
+                        detail_for_pdf = detailed_route_analysis(
+                            dep_choice_pdf, auto["lat"], auto["lon"], last_miles=20.0, vehicle=veh_payload_pdf
+                        )
+                        if detail_for_pdf.get("path"):
+                            route_img_for_pdf = render_route_image(detail_for_pdf["path"], auto["lat"], auto["lon"])
+                        # steps already filtered to flagged/advisory rows in your analyzer
+                        route_flags_for_pdf = detail_for_pdf.get("steps", [])
+                except Exception:
+                    pass
+
                 
                 pdf_bytes2 = build_pdf_report(pdf_ctx)
                 if pdf_bytes2:
@@ -2022,6 +2108,7 @@ if auto:
                         )
                     else:
                         st.info("No vehicle-specific conflicts detected in the analysed segment.")
+
 
 
 
