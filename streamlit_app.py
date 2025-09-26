@@ -1226,6 +1226,7 @@ if auto:
                 cols=2,
                 fmt={"Wind (m/s)": ".1f", "Slope (%)": ".1f", "Hospital distance (km)": ".2f"}
             )
+
             kv_block(
                 "Separations (~400 m)",
                 {
@@ -1239,42 +1240,71 @@ if auto:
                     "Land use": land_use,
                 },
                 cols=2,
-                fmt={"Building (m)": ".1f", "Road/footpath (m)": ".1f"}
+                fmt={"Building (m)": ".1f", "Road/footpath (m)": ".1f", "Railway (m)": ".1f", "Watercourse (m)": ".0f"}
             )
+
             kv_block(
                 "Vehicle",
                 {
-                    "Type": veh_type,
-                    "Length (m)": veh_len,
-                    "Width (m)": veh_wid,
-                    "Height (m)": veh_hei,
-                    "Turning circle (m)": veh_turn,
+                    "Type": vehicle_type,
+                    "Length (m)": veh_length_m,
+                    "Width (m)": veh_width_m,
+                    "Height (m)": veh_height_m,
+                    "Turning circle (m)": turning_circle_m,
                 },
                 cols=2,
                 fmt={"Length (m)": ".1f", "Width (m)": ".2f", "Height (m)": ".2f", "Turning circle (m)": ".1f"}
             )
 
             st.markdown("### Risk result")
-            st.metric("Score", f"{risk['score']:.1f}/100", risk["grade"])
-            st.success(f"{risk['grade']} — {risk['explain']}" if risk["grade"] == "PASS" else risk["explain"])
+            badge = ("✅ PASS" if risk.status=="PASS"
+                     else "🟡 ATTENTION" if risk.status=="ATTENTION"
+                     else "🟥 BLOCKER")
+            st.subheader(f"{risk.score:.1f}/100  {badge}")
+            st.markdown("#### Top contributing factors")
+            for p, m in risk.explain[:6]:
+                st.write(f"+{p} {m}")
+
+            if MAPBOX_TOKEN:
+                st.markdown("#### Map")
+                img = fetch_map(st.session_state["auto"]["lat"], st.session_state["auto"]["lon"])
+                if img:
+                    st.image(img, caption="Map (centered on W3W)", use_container_width=True)
 
         with right:
             st.markdown("### AI commentary")
-            for i, (sec, txt) in enumerate(ai.items(), start=1):
-                with st.expander(f"[{i}] {sec}", expanded=(i == 1)):
-                    st.write(txt)
+            sections = [
+                "Safety Risk Profile",
+                "Environmental Considerations",
+                "Access & Logistics",
+                "Overall Site Suitability",
+            ]
+            for i, k in enumerate(sections, start=1):
+                with st.expander(f"[{i}] {k}", expanded=(i == 1)):
+                    st.write(ai[k])
 
             st.markdown("### Recommended controls")
-            for ctl in RECOMMENDED_BASE + RECOMMENDED_EXTRA:
-                st.markdown(f"- {ctl}")
+            controls_list = [
+                "Use a trained banksman during manoeuvres and reversing.",
+                "Add temporary cones/signage; consider a convex mirror or visibility aids.",
+                "Plan approach/egress to avoid reversing where practicable.",
+            ]
+            if stand_surface in ("gravel", "grass"):
+                controls_list.append("Ensure firm, level stand surface (temporary mats if required).")
+            if overhead_m is not None and overhead_m < CoP["overhead_info_m"]:
+                controls_list.append("Confirm isolation/clearance for overhead power; position tanker outside bands.")
+            # Light tunnel hint based on quick analysis:
+            if (auto.get("route_snap", {}).get("counts", {}).get("tunnel", 0) or 0) > 0:
+                controls_list.append("⚠️ LPG tankers: tunnels/underpasses noted on approach — plan a compliant diversion.")
+            for b in controls_list:
+                st.write("• " + b)
 
-            # ---------- Access suitability ----------
-            st.markdown("### Access suitability (vehicle vs restrictions)")
-            # your existing access check logic …
-            if veh_turn >= 15 and veh_hei <= 4.5:
+            st.markdown("---")
+            st.subheader("Access suitability (vehicle vs restrictions)")
+            if stand_surface in ("asphalt", "concrete", "block paving") and turning_circle_m <= 22.0:
                 st.success("PASS — no blocking restrictions detected for the selected vehicle.")
             else:
-                st.warning("ATTENTION — vehicle may face access issues (check turning circle or height).")
+                st.info("ATTENTION — check turning area / bearing capacity for the selected vehicle.")
 
             # ---------- Route analysis (last 20 miles) ----------
             st.markdown("### Route analysis (last 20 miles) ↪")
@@ -1282,6 +1312,7 @@ if auto:
             full = rs.get("full_miles")
             st.caption(f"Full route: {full if full is not None else 'n/a'} miles • Analysed segment: ~last 20 miles (nearest to site)")
 
+            # Counts panel (always show)
             counts = rs.get("counts") or {}
             pretty = {
                 "Gates/barriers": counts.get("barrier_gate", 0),
@@ -1297,14 +1328,14 @@ if auto:
             }
             def badge(v:int)->str:
                 if v <= 0: col="#289e41"
-                elif v == 1: col="#e0a10b"
+                elif v==1: col="#e0a10b"
                 else: col="#cc2b2b"
                 return f"<span style='background:{col};color:#fff;border-radius:8px;padding:2px 8px;font-weight:600'>{v}</span>"
 
             ccols = st.columns(2)
             idx = 0
             for k, v in pretty.items():
-                with ccols[idx % 2]:
+                with ccols[idx%2]:
                     st.markdown(f"<div style='margin-bottom:6px'><b>{k}:</b> {badge(v)}</div>", unsafe_allow_html=True)
                 idx += 1
 
@@ -1317,7 +1348,7 @@ if auto:
                 detail = detailed_route_analysis(dep_choice, auto["lat"], auto["lon"], last_miles=20.0)
 
                 if detail["path"]:
-                    # show interactive map
+                    # interactive route map
                     path_layer = pdk.Layer(
                         "PathLayer",
                         [{"path": detail["path"], "name": "Route"}],
@@ -1335,16 +1366,25 @@ if auto:
                         pickable=True,
                     )
                     view_state = pdk.ViewState(latitude=auto["lat"], longitude=auto["lon"], zoom=11)
-                    st.pydeck_chart(pdk.Deck(layers=[path_layer, flag_layer], initial_view_state=view_state, tooltip={"text": "{flags}\n{name}"}))
+                    st.pydeck_chart(
+                        pdk.Deck(
+                            layers=[path_layer, flag_layer],
+                            initial_view_state=view_state,
+                            tooltip={"text": "{flags}\n{name}"}
+                        )
+                    )
 
-                    # flagged steps table
+                    # flagged steps table + CSV
                     if detail["steps"]:
-                        df = pd.DataFrame(detail["steps"]).drop(columns=["_lat","_lon"])
+                        df = pd.DataFrame(detail["steps"]).drop(columns=["_lat", "_lon"])
                         st.dataframe(df, use_container_width=True)
-                        csv = df.to_csv(index=False).encode()
-                        st.download_button("Download flagged steps (CSV)", data=csv, file_name="route_flags.csv", mime="text/csv")
+                        st.download_button(
+                            "Download flagged steps (CSV)",
+                            data=df.to_csv(index=False).encode(),
+                            file_name="route_flags.csv",
+                            mime="text/csv"
+                        )
                     else:
                         st.info("No flagged steps detected in the last 20 miles.")
-
                 else:
                     st.warning("Could not fetch detailed route data for this depot.")
