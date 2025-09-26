@@ -975,28 +975,28 @@ def build_pdf_report(ctx: Dict) -> bytes:
             super().__init__(*args, **kwargs)
             self._saved_page_states = []
             self.created_str = created_str
-
+    
         def showPage(self):
+            # Save current page state, but DO NOT emit the page yet.
             self._saved_page_states.append(dict(self.__dict__))
-            super().showPage()
-
+            self._startPage()  # ← was: super().showPage()
+    
         def save(self):
             page_count = len(self._saved_page_states)
             for state in self._saved_page_states:
                 self.__dict__.update(state)
                 self._draw_footer(page_count)
-                super().showPage()
+                super().showPage()  # now emit
             super().save()
-
+    
         def _draw_footer(self, page_count):
             w, h = A4
             left_margin = 16*mm
             right_margin = w - 16*mm
             self.setFont("Helvetica", 9)
-            # left: created timestamp
             self.drawString(left_margin, 10*mm, f"Created: {self.created_str}")
-            # right: page number
             self.drawRightString(right_margin, 10*mm, f"Page {self._pageNumber} of {page_count}")
+
 
     created_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
@@ -2015,6 +2015,7 @@ if auto:
                         )
                     else:
                         st.info("No vehicle-specific conflicts detected in the analysed segment.")
+
 
 
 
