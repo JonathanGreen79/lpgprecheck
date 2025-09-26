@@ -85,6 +85,38 @@ VEHICLE_PRESETS = {
     "LPG Tanker (Long Rigid)":{"length_m": 11.0, "width_m": 2.5, "height_m": 3.7, "turning_circle_m": 21.0},
 }
 
+# ------------------------- Depots (from your list) -------------------------
+DEPOTS = [
+    {"name": "Blaydon",       "lat": 54.9756187, "lon": -1.744101},
+    {"name": "Buckfastleigh", "lat": 50.4869034, "lon": -3.7833235},
+    {"name": "Burton",        "lat": 52.7768106, "lon": -1.559383},
+    {"name": "Cairnhill",     "lat": 57.3820238, "lon": -2.556494},
+    {"name": "Carlisle",      "lat": 54.898308,  "lon": -2.950747},
+    {"name": "Conwy",         "lat": 53.2876319, "lon": -3.8574551},
+    {"name": "Defford",       "lat": 52.0883951, "lon": -2.161253},
+    {"name": "Evanton",       "lat": 57.6723499, "lon": -4.3069473},
+    {"name": "Fawley",        "lat": 50.8490674, "lon": -1.3778735},
+    {"name": "Grangemouth",   "lat": 56.0224567, "lon": -3.7212715},
+    {"name": "Knowsley",      "lat": 53.4630737, "lon": -2.8682086},
+    {"name": "Launceston",    "lat": 50.6278182, "lon": -4.3922685},
+    {"name": "Leeds",         "lat": 53.7829647, "lon": -1.5059716},
+    {"name": "Llandarcy",     "lat": 51.6391619, "lon": -3.8451237},
+    {"name": "Ludham",        "lat": 52.7241592, "lon":  1.5499137},
+    {"name": "Newport",       "lat": 51.5675306, "lon": -2.9782096},
+    {"name": "Paisley",       "lat": 55.8532784, "lon": -4.424505},
+    {"name": "Perth",         "lat": 56.4169938, "lon": -3.4755149},
+    {"name": "Peterborough",  "lat": 52.5776289, "lon": -0.2142451},
+    {"name": "Presteigne",    "lat": 52.2688513, "lon": -2.9945084},
+    {"name": "Rainham",       "lat": 51.509824,  "lon":  0.1698276},
+    {"name": "Sittingbourne", "lat": 51.3850881, "lon":  0.7530866},
+    {"name": "Skegness",      "lat": 53.2554345, "lon":  0.2666851},
+    {"name": "Staveley",      "lat": 53.2761913, "lon": -1.355699},
+    {"name": "Stoke",         "lat": 52.9648079, "lon": -2.1676655},
+    {"name": "Swinton",       "lat": 55.7230767, "lon": -2.2697802},
+    {"name": "Witney",        "lat": 51.7926625, "lon": -1.5068047},
+    {"name": "Wrexham",       "lat": 53.0264358, "lon": -2.9252352},
+]
+
 # ------------------------- Geom helpers -------------------------
 def meters_per_degree(lat_deg: float) -> Tuple[float, float]:
     lat = math.radians(lat_deg)
@@ -120,6 +152,24 @@ def dist_poly(lat0, lon0, poly):
     if not poly or len(poly) < 3:
         return None
     return dist_line(lat0, lon0, poly + poly[:1])
+
+# Great-circle (Haversine) distance in miles
+def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R_km = 6371.0088
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dl/2)**2
+    km = 2 * R_km * math.asin(math.sqrt(a))
+    return km * 0.621371
+
+def nearest_depot(lat: float, lon: float) -> Dict[str, Optional[float]]:
+    best = None
+    for d in DEPOTS:
+        miles = haversine_miles(lat, lon, d["lat"], d["lon"])
+        if best is None or miles < best["miles"]:
+            best = {"name": d["name"], "miles": miles, "lat": d["lat"], "lon": d["lon"]}
+    return best or {"name": "n/a", "miles": None, "lat": None, "lon": None}
 
 # ------------------------- External data -------------------------
 def w3w_to_latlon(words: str) -> Tuple[Optional[float], Optional[float]]:
@@ -209,6 +259,7 @@ out tags geom;
     except Exception:
         return {"elements": []}
 
+# ---- Nearest hospital with escalating radius
 def nearest_hospital(lat: float, lon: float) -> Dict:
     """Return nearest hospital-like feature up to 10 km."""
     radii = [400, 1000, 3000, 10000]
@@ -574,7 +625,6 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
     if sum(bool(v) for v in found.values()) < 2:
         inline = text
         for k in section_keys:
-            # insert newlines ONLY for tokens like "Heading:" or "Heading -"
             inline = re.sub(
                 rf"(?i)(?<!\n)\s+({re.escape(k)})\s*[:\-–—]\s*",
                 r"\n\1: ",
@@ -582,10 +632,8 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
             )
         found = slice_by_matches(inline)
 
-    # Load into final dict and tidy leading punctuation
     for k in section_keys:
         v = (found.get(k) or "").strip()
-        # remove any leading punctuation left behind if split mid-sentence by model formatting
         v = v.lstrip(" .,:;–—-")
         sections[k] = v or "No additional notes for this section."
 
@@ -726,11 +774,13 @@ if run:
             osm  = overpass_near(lat, lon, radius=400)
             feats = parse_osm(lat, lon, osm)
             hosp = nearest_hospital(lat, lon)
+            depot = nearest_depot(lat, lon)
 
             st.session_state["auto"] = {
                 "lat": lat, "lon": lon,
                 "addr": addr,
                 "hospital": hosp,
+                "nearest_depot": depot,  # <- store for immediate display
                 "wind_mps": wind.get("speed_mps") or 0.0,
                 "wind_deg": wind.get("deg") or 0,
                 "wind_comp": wind.get("compass") or "n/a",
@@ -839,6 +889,18 @@ if auto:
         st.session_state[f"{basekey}_width_m"]  = veh_width_m
         st.session_state[f"{basekey}_height_m"] = veh_height_m
         st.session_state[f"{basekey}_turning_circle_m"] = turning_circle_m
+
+        # ---------------- Nearest Depot & Logistics (NEW) ----------------
+        st.markdown("---")
+        st.subheader("Nearest Depot & Logistics")
+        nd = auto.get("nearest_depot") or nearest_depot(auto["lat"], auto["lon"])
+        nd_name = nd["name"] if nd and nd.get("name") else "—"
+        nd_miles = f"{nd['miles']:.1f} miles" if nd and isinstance(nd.get("miles"), (int, float)) else "—"
+        cnd1, cnd2 = st.columns(2)
+        with cnd1:
+            st.text_input("Nearest depot", nd_name, disabled=True, key="nearest_depot_name_ro")
+        with cnd2:
+            st.text_input("Distance (miles)", nd_miles, disabled=True, key="nearest_depot_dist_ro")
 
         st.markdown("---")
         st.subheader("Site options")
@@ -1159,4 +1221,3 @@ if auto:
                 )
             else:
                 st.caption("PDF generation unavailable on this host (ReportLab not installed).")
-
