@@ -1,11 +1,8 @@
-# streamlit_app.py
 import os, io, math, json, requests, re
 from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass
 
 import streamlit as st
-import pandas as pd
-import pydeck as pdk
 from PIL import Image
 
 # ------------------------- Page config -------------------------
@@ -30,7 +27,13 @@ MAPBOX_TOKEN   = get_secret("MAPBOX_TOKEN")
 APP_PASSWORD   = get_secret("APP_PASSWORD", "")  # <-- password lives with your API keys
 AI_MODEL       = get_secret("AI_MODEL", "gpt-4o-mini")  # optional override
 
-UA = {"User-Agent": "LPG-Precheck/1.9"}
+UA = {"User-Agent": "LPG-Precheck/1.8"}
+
+# -------- Performance / routing settings --------
+ROUTE_ANALYSIS_PREVIEW = True          # show quick route snapshot (nearest depot) in the form
+ROUTE_LAST_MILES_FOR_WINDING = 1.0     # last N miles to score winding
+OSRM_TIMEOUT_SEC = 25
+CACHE_TTL = 60 * 30                     # 30 minutes
 
 # ------------------------- Auth + status helpers -------------------------
 def is_authed() -> bool:
@@ -87,47 +90,37 @@ VEHICLE_PRESETS = {
     "LPG Tanker (Urban)":     {"length_m": 9.2,  "width_m": 2.5, "height_m": 3.6, "turning_circle_m": 19.0},
     "LPG Tanker (Long Rigid)":{"length_m": 11.0, "width_m": 2.5, "height_m": 3.7, "turning_circle_m": 21.0},
 }
-# (simple gross weights for a couple of rules; used in route flags)
-VEHICLE_GVW_T = {
-    "3.5t Van": 3.5,
-    "7.5t Rigid": 7.5,
-    "18t Rigid": 18,
-    "26t Rigid": 26,
-    "Artic (44t)": 44,
-    "LPG Tanker (Urban)": 26,
-    "LPG Tanker (Long Rigid)": 26,
-}
 
-# ------------------------- Your depot list -------------------------
-DEPOTS: List[Dict[str, float]] = [
-    {"name":"Blaydon","lon":-1.744101,"lat":54.9756187},
-    {"name":"Buckfastleigh","lon":-3.7833235,"lat":50.4869034},
-    {"name":"Burton","lon":-1.559383,"lat":52.7768106},
-    {"name":"Cairnhill","lon":-2.556494,"lat":57.3820238},
-    {"name":"Carlisle","lon":-2.950747,"lat":54.898308},
-    {"name":"Conwy","lon":-3.8574551,"lat":53.2876319},
-    {"name":"Defford","lon":-2.161253,"lat":52.0883951},
-    {"name":"Evanton","lon":-4.3069473,"lat":57.6723499},
-    {"name":"Fawley","lon":-1.3778735,"lat":50.8490674},
-    {"name":"Grangemouth","lon":-3.7212715,"lat":56.0224567},
-    {"name":"Knowsley","lon":-2.8682086,"lat":53.4630737},
-    {"name":"Launceston","lon":-4.3922685,"lat":50.6278182},
-    {"name":"Leeds","lon":-1.5059716,"lat":53.7829647},
-    {"name":"Llandarcy","lon":-3.8451237,"lat":51.6391619},
-    {"name":"Ludham","lon":1.5499137,"lat":52.7241592},
-    {"name":"Newport","lon":-2.9782096,"lat":51.5675306},
-    {"name":"Paisley","lon":-4.424505,"lat":55.8532784},
-    {"name":"Perth","lon":-3.4755149,"lat":56.4169938},
-    {"name":"Peterborough","lon":-0.2142451,"lat":52.5776289},
-    {"name":"Presteigne","lon":-2.9945084,"lat":52.2688513},
-    {"name":"Rainham","lon":0.1698276,"lat":51.509824},
-    {"name":"Sittingbourne","lon":0.7530866,"lat":51.3850881},
-    {"name":"Skegness","lon":0.2666851,"lat":53.2554345},
-    {"name":"Staveley","lon":-1.355699,"lat":53.2761913},
-    {"name":"Stoke","lon":-2.1676655,"lat":52.9648079},
-    {"name":"Swinton","lon":-2.2697802,"lat":55.7230767},
-    {"name":"Witney","lon":-1.5068047,"lat":51.7926625},
-    {"name":"Wrexham","lon":-2.9252352,"lat":53.0264358},
+# ------------------------- Depot list (name, lon, lat) -------------------------
+DEPOTS: List[Dict[str, float | str]] = [
+    {"name":"Blaydon",       "lon":-1.744101,  "lat":54.9756187},
+    {"name":"Buckfastleigh", "lon":-3.7833235, "lat":50.4869034},
+    {"name":"Burton",        "lon":-1.559383,  "lat":52.7768106},
+    {"name":"Cairnhill",     "lon":-2.556494,  "lat":57.3820238},
+    {"name":"Carlisle",      "lon":-2.950747,  "lat":54.898308},
+    {"name":"Conwy",         "lon":-3.8574551, "lat":53.2876319},
+    {"name":"Defford",       "lon":-2.161253,  "lat":52.0883951},
+    {"name":"Evanton",       "lon":-4.3069473, "lat":57.6723499},
+    {"name":"Fawley",        "lon":-1.3778735, "lat":50.8490674},
+    {"name":"Grangemouth",   "lon":-3.7212715, "lat":56.0224567},
+    {"name":"Knowsley",      "lon":-2.8682086, "lat":53.4630737},
+    {"name":"Launceston",    "lon":-4.3922685, "lat":50.6278182},
+    {"name":"Leeds",         "lon":-1.5059716, "lat":53.7829647},
+    {"name":"Llandarcy",     "lon":-3.8451237, "lat":51.6391619},
+    {"name":"Ludham",        "lon": 1.5499137, "lat":52.7241592},
+    {"name":"Newport",       "lon":-2.9782096, "lat":51.5675306},
+    {"name":"Paisley",       "lon":-4.424505,  "lat":55.8532784},
+    {"name":"Perth",         "lon":-3.4755149, "lat":56.4169938},
+    {"name":"Peterborough",  "lon":-0.2142451, "lat":52.5776289},
+    {"name":"Presteigne",    "lon":-2.9945084, "lat":52.2688513},
+    {"name":"Rainham",       "lon": 0.1698276, "lat":51.509824},
+    {"name":"Sittingbourne", "lon": 0.7530866, "lat":51.3850881},
+    {"name":"Skegness",      "lon": 0.2666851, "lat":53.2554345},
+    {"name":"Staveley",      "lon":-1.355699,  "lat":53.2761913},
+    {"name":"Stoke",         "lon":-2.1676655, "lat":52.9648079},
+    {"name":"Swinton",       "lon":-2.2697802, "lat":55.7230767},
+    {"name":"Witney",        "lon":-1.5068047, "lat":51.7926625},
+    {"name":"Wrexham",       "lon":-2.9252352, "lat":53.0264358},
 ]
 
 # ------------------------- Geom helpers -------------------------
@@ -145,27 +138,39 @@ def _dist_m(lat0, lon0, lat1, lon1) -> float:
     dx, dy = ll_to_xy(lat0, lon0, lat1, lon1)
     return math.hypot(dx, dy)
 
-def hav_m(lat1, lon1, lat2, lon2) -> float:
-    R = 6371000.0
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2-lat1)
-    dlmb = math.radians(lon2-lon1)
-    a = math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dlmb/2)**2
-    return 2*R*math.asin(math.sqrt(a))
+def _bearing_deg(lat1, lon1, lat2, lon2) -> float:
+    """Initial bearing (0-360) from point1 to point2 (more accurate great-circle)."""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dlambda = math.radians(lon2 - lon1)
+    x = math.sin(dlambda) * math.cos(phi2)
+    y = math.cos(phi1)*math.sin(phi2) - math.sin(phi1)*math.cos(phi2)*math.cos(dlambda)
+    b = (math.degrees(math.atan2(x, y)) + 360.0) % 360.0
+    return b
 
-def cumulative_lengths_m(latlon: List[Tuple[float,float]]) -> List[float]:
-    out=[0.0]
-    for (a,b) in zip(latlon, latlon[1:]):
-        out.append(out[-1]+hav_m(a[0],a[1],b[0],b[1]))
-    return out
+def _compass8(deg: float) -> str:
+    pts = ["N","NE","E","SE","S","SW","W","NW"]
+    return pts[round((deg % 360)/45) % 8]
 
-def nearest_depots(lat: float, lon: float, n: int = 3) -> List[Dict]:
-    items=[]
-    for d in DEPOTS:
-        dm = hav_m(lat, lon, d["lat"], d["lon"])
-        items.append({"name": d["name"], "lat": d["lat"], "lon": d["lon"], "miles": dm/1609.34})
-    items.sort(key=lambda x: x["miles"])
-    return items[:n]
+def dist_line(lat0, lon0, line):
+    if not line or len(line) < 2:
+        return None
+    px, py = 0.0, 0.0
+    verts = [ll_to_xy(lat0, lon0, la, lo) for la, lo in line]
+    best = None
+    for (ax, ay), (bx, by) in zip(verts, verts[1:]):
+        apx, apy = px - ax, py - ay
+        abx, aby = bx - ax, by - ay
+        ab2 = abx*abx + aby*aby
+        t = 0.0 if ab2 == 0 else max(0.0, min(1.0, (apx*abx + apy*aby) / ab2))
+        cx, cy = ax + t*abx, ay + t*aby
+        d = math.hypot(px - cx, py - cy)
+        best = d if best is None else min(best, d)
+    return best
+
+def dist_poly(lat0, lon0, poly):
+    if not poly or len(poly) < 3:
+        return None
+    return dist_line(lat0, lon0, poly + poly[:1])
 
 # ------------------------- External data -------------------------
 def w3w_to_latlon(words: str) -> Tuple[Optional[float], Optional[float]]:
@@ -228,6 +233,16 @@ def open_meteo(lat, lon) -> Dict:
         pass
     return {"speed_mps": None, "deg": None, "compass": None}
 
+# --- Cached Overpass wrapper (used by local surroundings only) ---
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def cached_overpass(q: str) -> Dict:
+    try:
+        r = requests.post(OVERPASS, data={"data": q}, headers=UA, timeout=90)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return {"elements": []}
+
 def overpass_near(lat, lon, radius=400) -> Dict:
     q = f"""
 [out:json][timeout:60];
@@ -248,14 +263,9 @@ def overpass_near(lat, lon, radius=400) -> Dict:
 );
 out tags geom;
 """.strip()
-    try:
-        r = requests.post(OVERPASS, data={"data": q}, headers=UA, timeout=90)
-        r.raise_for_status()
-        return r.json()
-    except Exception:
-        return {"elements": []}
+    return cached_overpass(q)
 
-# --- Nearest hospital (unchanged) ---
+# ---- Nearest hospital with escalating radius
 def nearest_hospital(lat: float, lon: float) -> Dict:
     radii = [400, 1000, 3000, 10000]
     best = None
@@ -278,9 +288,7 @@ def nearest_hospital(lat: float, lon: float) -> Dict:
 out tags geom 20;
 """
         try:
-            resp = requests.post(OVERPASS, data={"data": q}, headers=UA, timeout=90)
-            resp.raise_for_status()
-            data = resp.json().get("elements", [])
+            data = cached_overpass(q).get("elements", [])
         except Exception:
             data = []
         for el in data:
@@ -303,12 +311,6 @@ out tags geom 20;
         if best:
             break
     return best or {"name": "n/a", "distance_m": None, "lat": None, "lon": None}
-
-def dist_poly(lat0, lon0, poly):
-    if not poly or len(poly) < 3:
-        return None
-    # distance to closed polygon -> reuse line distance, closing the ring
-    return dist_line(lat0, lon0, poly + poly[:1])
 
 def parse_osm(lat0, lon0, data) -> Dict:
     bpolys, roads, drains, manholes, plines, pnodes, rails, wlines, wpolys, land_polys = [],[],[],[],[],[],[],[],[],[]
@@ -459,7 +461,7 @@ def risk_score(
     why.sort(key=lambda x: -x[0])
     return RiskResult(pts, status, why)
 
-# ------------------------- Map utils -------------------------
+# ------------------------- Map -------------------------
 def fetch_map(lat, lon, zoom=17, size=(1000, 700)) -> Optional[Image.Image]:
     if not MAPBOX_TOKEN:
         return None
@@ -474,171 +476,7 @@ def fetch_map(lat, lon, zoom=17, size=(1000, 700)) -> Optional[Image.Image]:
     except Exception:
         return None
 
-# ------------------------- OSRM route + hazards (20 mi near site) -------------------------
-def osrm_route(start_lon, start_lat, end_lon, end_lat) -> Dict:
-    url = f"https://router.project-osrm.org/route/v1/driving/{start_lon},{start_lat};{end_lon},{end_lat}"
-    params = {"overview":"full","geometries":"geojson","annotations":"false"}
-    try:
-        r = requests.get(url, params=params, headers=UA, timeout=25)
-        r.raise_for_status()
-        data = r.json()
-        if not data.get("routes"):
-            return {}
-        route = data["routes"][0]
-        coords = route["geometry"]["coordinates"]  # [lon,lat]
-        return {"distance_m": route.get("distance"), "duration_s": route.get("duration"), "coords": coords}
-    except Exception:
-        return {}
-
-def crop_last_miles(route_coords: List[List[float]], miles: float = 20.0) -> List[List[float]]:
-    if not route_coords:
-        return []
-    latlon = [(c[1], c[0]) for c in route_coords]
-    cum = cumulative_lengths_m(latlon)
-    need = miles * 1609.34
-    if cum[-1] <= need:
-        return route_coords
-    cut_start = 0
-    target = cum[-1] - need
-    # find first index where cum[i] >= target
-    for i, v in enumerate(cum):
-        if v >= target:
-            cut_start = max(0, i-1)
-            break
-    return route_coords[cut_start:]
-
-def overpass_hazards_along(coords_lonlat: List[List[float]], search_width_m: float = 35.0) -> List[Dict]:
-    """Scan along a polyline and fetch OSM features that may be restrictions."""
-    if not coords_lonlat:
-        return []
-    # sample every ~400 m along the line for a bbox based query
-    latlon = [(c[1], c[0]) for c in coords_lonlat]
-    cum = cumulative_lengths_m(latlon)
-    pts = [0.0]
-    total = cum[-1]
-    step = 400.0
-    x = step
-    while x < total:
-        pts.append(x)
-        x += step
-    pts.append(total)
-
-    # helper: find approximate lat/lon at distance d
-    def point_at(d):
-        for i in range(len(cum)-1):
-            if cum[i] <= d <= cum[i+1]:
-                t = 0 if cum[i+1]==cum[i] else (d-cum[i])/(cum[i+1]-cum[i])
-                la = latlon[i][0] + t*(latlon[i+1][0]-latlon[i][0])
-                lo = latlon[i][1] + t*(latlon[i+1][1]-latlon[i][1])
-                return la, lo
-        return latlon[-1][0], latlon[-1][1]
-
-    hazards=[]
-    seen=set()
-    for d in pts:
-        la, lo = point_at(d)
-        # radius ~ search_width_m
-        rad = max(30, min(80, int(search_width_m)))
-        q = f"""
-[out:json][timeout:40];
-(
-  way(around:{rad},{la},{lo})["tunnel"];
-  way(around:{rad},{la},{lo})["hazmat"];
-  way(around:{rad},{la},{lo})["maxheight"];
-  way(around:{rad},{la},{lo})["maxwidth"];
-  way(around:{rad},{la},{lo})["maxweight"];
-  way(around:{rad},{la},{lo})["barrier"];
-  node(around:{rad},{la},{lo})["barrier"];
-  way(around:{rad},{la},{lo})["ford"];
-  way(around:{rad},{la},{lo})["highway"="living_street"];
-  way(around:{rad},{la},{lo})["surface"~"gravel|ground|unpaved|grass|dirt"];
-  node(around:{rad},{la},{lo})["railway"="level_crossing"];
-);
-out tags center 50;
-"""
-        try:
-            r = requests.post(OVERPASS, data={"data": q}, headers=UA, timeout=60)
-            r.raise_for_status()
-            eles = r.json().get("elements", [])
-        except Exception:
-            eles = []
-        for el in eles:
-            eid = f"{el.get('type')}:{el.get('id')}"
-            if eid in seen: 
-                continue
-            seen.add(eid)
-            tags = el.get("tags", {}) or {}
-            cla, clo = (el.get("lat"), el.get("lon")) if el.get("type")=="node" else ( (el.get("center") or {}).get("lat"), (el.get("center") or {}).get("lon") )
-            if cla is None or clo is None:
-                continue
-            hazards.append({"id":eid,"tags":tags,"lat":cla,"lon":clo})
-    return hazards
-
-def classify_issue(tags: Dict[str,str], veh_h: float, veh_w: float, veh_t: float, is_lpg: bool) -> Tuple[str,str]:
-    """Return (severity, pretty_label) from tags."""
-    # tunnels are a hard BLOCKER for LPG
-    if tags.get("tunnel") in ("yes","building_passage","culvert"):
-        return ("BLOCKER","Tunnel (LPG prohibited)" if is_lpg else "Tunnel")
-
-    # heights
-    if "maxheight" in tags:
-        # parse meters or imperial like 13'6"
-        v = tags["maxheight"]
-        mh = None
-        try:
-            if "m" in v:
-                mh = float(re.findall(r"([0-9]+(?:\.[0-9]+)?)", v)[0])
-            elif "'" in v:
-                m_ = re.findall(r"(\d+)'(?:\s*(\d+))?\"", v)
-                if m_:
-                    ft = int(m_[0][0]); inch = int(m_[0][1]) if m_[0][1] else 0
-                    mh = (ft*12 + inch) * 0.0254
-            else:
-                mh = float(re.findall(r"([0-9]+(?:\.[0-9]+)?)", v)[0])
-        except Exception:
-            pass
-        if mh is not None:
-            return ("BLOCKER" if veh_h>mh else "ATTENTION", f"Height restriction {mh:.2f} m")
-
-    if "maxwidth" in tags:
-        try:
-            mw = float(re.findall(r"([0-9]+(?:\.[0-9]+)?)", tags["maxwidth"])[0])
-            return ("BLOCKER" if veh_w>mw else "ATTENTION", f"Width restriction {mw:.2f} m")
-        except Exception:
-            return ("ATTENTION","Width restriction")
-
-    if "maxweight" in tags:
-        try:
-            wt = float(re.findall(r"([0-9]+(?:\.[0-9]+)?)", tags["maxweight"])[0])
-            return ("BLOCKER" if veh_t>wt else "ATTENTION", f"Weight limit {wt:.1f} t")
-        except Exception:
-            return ("ATTENTION","Weight limit")
-
-    if tags.get("barrier") in ("gate","lift_gate"):
-        return ("ATTENTION","Gate")
-    if tags.get("barrier") in ("bollard","block"):
-        return ("ATTENTION","Bollard")
-    if tags.get("barrier") == "height_restrictor":
-        return ("ATTENTION","Height restrictor")
-
-    if tags.get("railway") == "level_crossing":
-        return ("ATTENTION","Level crossing")
-
-    if tags.get("ford") == "yes":
-        return ("ATTENTION","Ford")
-
-    if tags.get("hazmat") in ("no","designated"):
-        return ("ATTENTION","Hazmat restriction")
-
-    if tags.get("highway") == "living_street":
-        return ("ATTENTION","Unsuitable road class")
-
-    if tags.get("surface") in ("gravel","ground","unpaved","grass","dirt"):
-        return ("ATTENTION","Poor surface")
-
-    return ("INFO","Restriction")
-
-# ------------------------- AI commentary -------------------------
+# ------------------------- AI commentary (ONLINE default, OFFLINE fallback) -------------------------
 def _offline_ai_sections(ctx: Dict) -> Dict[str, str]:
     feats, wind = ctx["feats"], ctx["wind"]
     slope_pct = ctx["slope_pct"] or 0.0
@@ -647,10 +485,6 @@ def _offline_ai_sections(ctx: Dict) -> Dict[str, str]:
     los = ctx["los_issue"]
     veg = ctx["veg_3m"]
     land = feats.get("land_class", "n/a")
-    rs = ctx.get("route_summary", {})
-    rtxt = ""
-    if rs:
-        rtxt = f" Nearest depot: {rs.get('nearest_depot','n/a')} ({rs.get('nearest_depot_miles','n/a')} mi). Last 20 mi flags: {rs.get('flags_text','none')}."
 
     s1 = (
         f"The local slope is {slope_pct:.1f}%. Key separations (m): "
@@ -666,8 +500,8 @@ def _offline_ai_sections(ctx: Dict) -> Dict[str, str]:
     )
     s3 = (
         f"Access lines of sight: {'restricted' if los else 'clear'}; "
-        f"enclosure effect {sides} solid side(s).{rtxt} "
-        f"Validate signage/restrictions; provide sound hardstanding and clear sightlines."
+        f"enclosure effect {sides} solid side(s). Validate signage/restrictions; "
+        f"provide sound hardstanding and clear sightlines."
     )
     s4 = (
         "Attention required — ensure separation compliance, ignition control, drainage protection, "
@@ -681,6 +515,9 @@ def _offline_ai_sections(ctx: Dict) -> Dict[str, str]:
     }
 
 def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
+    """
+    Call OpenAI for commentary and robustly parse output into four sections.
+    """
     if not OPENAI_API_KEY:
         raise RuntimeError("No OpenAI key")
 
@@ -710,18 +547,21 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
             "status": getattr(risk, "status", None),
             "drivers": getattr(risk, "explain", []),
         },
-        "route_summary": ctx.get("route_summary", {}),
     }
 
     system = (
         "You are a safety and logistics assistant writing concise LPG site pre-check commentary. "
         "Audience is field engineers; keep it professional, UK terminology. "
-        "Output exactly four sections with these headings on their own lines followed by a single paragraph: "
-        "### Safety Risk Profile\n### Environmental Considerations\n### Access & Logistics\n### Overall Site Suitability"
+        "Output exactly four sections with these exact headings, and put EACH heading on its own line, "
+        "followed by a single paragraph of text. No lists.\n"
+        "### Safety Risk Profile\n"
+        "### Environmental Considerations\n"
+        "### Access & Logistics\n"
+        "### Overall Site Suitability"
     )
     user = (
         "Using this site context, write those four sections (short, specific, actionable). "
-        "Focus Access & Logistics on approach/egress, nearest depot, and any route blockers (e.g., tunnels for LPG). "
+        "Avoid repeating all numbers verbatim unless helpful; focus on implications. "
         f"Context:\n{json.dumps(site, ensure_ascii=False)}"
     )
 
@@ -761,24 +601,36 @@ def _online_ai_sections(ctx: Dict, model: str = None) -> Dict[str, str]:
     head_line_re = re.compile(
         r"(?im)^\s*(?:#+\s*)?(?:\*\*)?(Safety Risk Profile|Environmental Considerations|Access & Logistics|Overall Site Suitability)(?:\*\*)?\s*:?\s*"
     )
+
     def slice_by_matches(txt: str) -> Dict[str, str]:
-        found={}
-        ms=list(head_line_re.finditer(txt))
-        if not ms:
+        found = {}
+        matches = list(head_line_re.finditer(txt))
+        if not matches:
             return found
-        for i,m in enumerate(ms):
-            k=m.group(1); s=m.end(); e=ms[i+1].start() if i+1<len(ms) else len(txt)
-            found[k]=txt[s:e].strip()
+        for idx, m in enumerate(matches):
+            key = m.group(1)
+            start = m.end()
+            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(txt)
+            body = txt[start:end].strip()
+            found[key] = body
         return found
+
     found = slice_by_matches(text)
     if sum(bool(v) for v in found.values()) < 2:
         inline = text
         for k in section_keys:
-            inline = re.sub(rf"(?i)(?<!\n)\s+({re.escape(k)})\s*[:\-–—]\s*", r"\n\1: ", inline)
+            inline = re.sub(
+                rf"(?i)(?<!\n)\s+({re.escape(k)})\s*[:\-–—]\s*",
+                r"\n\1: ",
+                inline,
+            )
         found = slice_by_matches(inline)
+
     for k in section_keys:
-        v=(found.get(k) or "").strip().lstrip(" .,:;–—-")
-        sections[k]=v or "No additional notes for this section."
+        v = (found.get(k) or "").strip()
+        v = v.lstrip(" .,:;–—-")
+        sections[k] = v or "No additional notes for this section."
+
     return sections
 
 def ai_sections(ctx: Dict) -> Dict[str, str]:
@@ -789,8 +641,14 @@ def ai_sections(ctx: Dict) -> Dict[str, str]:
             pass
     return _offline_ai_sections(ctx)
 
-# ------------------------- UI helpers -------------------------
-def nm_distance(label: str, key: str, auto_val: Optional[float], max_val: float = 2000.0, seed_tag: Optional[str] = None) -> Optional[float]:
+# ------------------------- UI helper: seeded, editable distance -------------------------
+def nm_distance(
+    label: str,
+    key: str,
+    auto_val: Optional[float],
+    max_val: float = 2000.0,
+    seed_tag: Optional[str] = None,
+) -> Optional[float]:
     tag = seed_tag or "__default__"
     if st.session_state.get(f"{key}__seed") != tag:
         st.session_state[f"{key}__nm"]  = (auto_val is None)
@@ -799,14 +657,20 @@ def nm_distance(label: str, key: str, auto_val: Optional[float], max_val: float 
 
     c1, c2 = st.columns([0.78, 0.22])
     with c1:
-        val = st.number_input(label, min_value=0.0, max_value=float(max_val), step=0.1,
-                              value=float(st.session_state[f"{key}__val"]), key=f"{key}__val_input")
+        val = st.number_input(
+            label,
+            min_value=0.0, max_value=float(max_val), step=0.1,
+            value=float(st.session_state[f"{key}__val"]),
+            key=f"{key}__val_input",
+        )
     with c2:
         nm = st.checkbox("Not mapped", value=st.session_state[f"{key}__nm"], key=f"{key}__nm_chk")
+
     st.session_state[f"{key}__val"] = val
     st.session_state[f"{key}__nm"]  = nm
     return None if nm else float(val)
 
+# ------------------------- Pretty key/value block -------------------------
 def kv_block(title: str, data: Dict, cols: int = 2, fmt: Dict[str, str] | None = None):
     st.markdown(f"### {title}" if title.lower().startswith("key") else f"#### {title}")
     keys = list(data.keys())
@@ -833,6 +697,129 @@ def kv_block(title: str, data: Dict, cols: int = 2, fmt: Dict[str, str] | None =
                         f"<div style='line-height:1.4'><b>{k}:</b> {show(k,v)}</div>",
                         unsafe_allow_html=True,
                     )
+
+# ------------------------- Nearest depots (crow-fly) -------------------------
+def nearest_depots(lat: float, lon: float, n: int = 3) -> List[Dict]:
+    rows = []
+    for d in DEPOTS:
+        dm = _dist_m(lat, lon, float(d["lat"]), float(d["lon"]))
+        rows.append({"name": d["name"], "miles": dm / 1609.344, "lat": d["lat"], "lon": d["lon"]})
+    rows.sort(key=lambda r: r["miles"])
+    return rows[:n]
+
+# ------------------------- OSRM quick route snapshot -------------------------
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def osrm_quick(start_lat: float, start_lon: float, end_lat: float, end_lon: float) -> Optional[Dict]:
+    """One fast OSRM call with simplified geometry & steps."""
+    try:
+        url = f"https://router.project-osrm.org/route/v1/driving/{start_lon},{start_lat};{end_lon},{end_lat}"
+        r = requests.get(
+            url,
+            params={"overview": "simplified", "geometries": "geojson", "steps": "true"},
+            timeout=OSRM_TIMEOUT_SEC,
+        )
+        if r.status_code != 200:
+            return None
+        js = r.json()
+        if not js.get("routes"):
+            return None
+        return js["routes"][0]
+    except Exception:
+        return None
+
+def _last_step_name(legs: List[Dict]) -> str:
+    try:
+        steps = legs[-1].get("steps") or []
+        # find last step with a non-empty name
+        for stp in reversed(steps):
+            nm = (stp.get("name") or "").strip()
+            if nm:
+                return nm
+    except Exception:
+        pass
+    return "n/a"
+
+def _approach_direction(route: Dict) -> str:
+    try:
+        coords = (route.get("geometry") or {}).get("coordinates") or []
+        if len(coords) >= 2:
+            lon1, lat1 = coords[-2]
+            lon2, lat2 = coords[-1]
+            b = _bearing_deg(lat1, lon1, lat2, lon2)
+            return f"from {_compass8(b)} ({b:.0f}°)"
+    except Exception:
+        pass
+    return "n/a"
+
+def _last_mile_winding(route: Dict, last_miles: float = 1.0) -> str:
+    """Sum absolute heading changes over the last N miles."""
+    try:
+        coords = (route.get("geometry") or {}).get("coordinates") or []
+        if len(coords) < 3:
+            return "Low"
+        # trim to last N miles
+        keep: List[List[float]] = [coords[-1]]
+        total = 0.0
+        for (lon2, lat2), (lon1, lat1) in zip(reversed(coords[-2:]), reversed(coords[:-1])):
+            d = _dist_m(lat1, lon1, lat2, lon2)
+            total += d
+            keep.append([lon1, lat1])
+            if (total / 1609.344) >= last_miles:
+                break
+        keep = list(reversed(keep))
+        # heading deltas
+        headings = []
+        for i in range(1, len(keep)):
+            lonA, latA = keep[i-1]
+            lonB, latB = keep[i]
+            headings.append(_bearing_deg(latA, lonA, latB, lonB))
+        # sum absolute smallest-angle changes
+        turn_sum = 0.0
+        for a, b in zip(headings, headings[1:]):
+            delta = abs((b - a + 180) % 360 - 180)
+            turn_sum += delta
+        # classify (tuned to feel sensible on UK B-roads)
+        if turn_sum < 90:
+            return "Low"
+        elif turn_sum < 180:
+            return "Medium"
+        else:
+            return "High"
+    except Exception:
+        return "Low"
+
+def _tunnel_hint(legs: List[Dict]) -> Optional[str]:
+    """Lightweight scan of OSRM step names for tunnel-ish hints."""
+    try:
+        last_leg = legs[-1]
+        for stp in last_leg.get("steps") or []:
+            txt = " ".join(str(stp.get(k) or "") for k in ("name","ref","destinations")).lower()
+            if any(w in txt for w in ("tunnel","underpass")):
+                return "⚠️ Possible tunnel/underpass in directions — LPG tankers are not permitted in tunnels. Full check in final assessment."
+    except Exception:
+        pass
+    return None
+
+def quick_route_snapshot(depot: Dict, site_lat: float, site_lon: float) -> Optional[Dict]:
+    """Return dict with distance_mi, eta_min, final_road, approach_dir, winding, tunnel_hint."""
+    rt = osrm_quick(depot["lat"], depot["lon"], site_lat, site_lon)
+    if not rt:
+        return None
+    dist_mi = (rt.get("distance") or 0.0) / 1609.344
+    eta_min = (rt.get("duration") or 0.0) / 60.0
+    legs = rt.get("legs") or []
+    final_road = _last_step_name(legs)
+    approach_dir = _approach_direction(rt)
+    winding = _last_mile_winding(rt, last_miles=ROUTE_LAST_MILES_FOR_WINDING)
+    hint = _tunnel_hint(legs)
+    return {
+        "distance_mi": dist_mi,
+        "eta_min": eta_min,
+        "final_road": final_road,
+        "approach_dir": approach_dir,
+        "winding": winding,
+        "tunnel_hint": hint,
+    }
 
 # ------------------------- Sidebar (status & access) -------------------------
 sidebar_secrets_status()
@@ -874,7 +861,7 @@ with c_run:
 with c_reset:
     reset = st.button("Reset", type="secondary", use_container_width=True, key="reset_btn")
 
-# Reset
+# Reset: clear data below and W3W, hide edit/results until new W3W entered
 if reset:
     for k in list(st.session_state.keys()):
         if k.startswith("d_") or k.endswith("__val") or k.endswith("__nm") or k.endswith("__seed") or k.startswith("veh_"):
@@ -904,7 +891,8 @@ if run:
             hosp = nearest_hospital(lat, lon)
 
             # nearest depots
-            dep_3 = nearest_depots(lat, lon, n=3)
+            top3 = nearest_depots(lat, lon, n=3)
+            nearest = top3[0] if top3 else None
 
             st.session_state["auto"] = {
                 "lat": lat, "lon": lon,
@@ -916,8 +904,9 @@ if run:
                 "slope_pct": 3.5,
                 "approach_avg": 0.9,
                 "approach_max": 3.5,
+                "nearest_depots": top3,
+                "nearest_depot": nearest,
                 **feats,
-                "nearest_depots": dep_3,
             }
             st.success("Auto data ready.")
 
@@ -929,7 +918,7 @@ if auto:
 
     st.markdown("### Edit & confirm")
     with st.form("inputs"):
-        # ---------------- Location & address ----------------
+        # ---------------- Location & address (FIRST) ----------------
         st.subheader("Location & address")
         a1, a2 = st.columns([0.6, 0.4])
         with a1:
@@ -1020,97 +1009,61 @@ if auto:
         st.session_state[f"{basekey}_height_m"] = veh_height_m
         st.session_state[f"{basekey}_turning_circle_m"] = turning_circle_m
 
-        # ---------------- Nearest Depot & Logistics (quick) ----------------
+        # ---------------- Nearest Depot & Logistics (with quick route snapshot) ----------------
         st.markdown("---")
         st.subheader("Nearest Depot & Logistics")
-        nd = nearest_depots(auto["lat"], auto["lon"], 3)
-        nearest_name = nd[0]["name"]
-        nearest_mi = nd[0]["miles"]
 
-        c1n, c2n = st.columns([0.6, 0.4])
-        with c1n:
-            st.text_input("Nearest depot", nearest_name, disabled=True)
-        with c2n:
-            st.text_input("Distance (miles)", f"{nearest_mi:.1f} miles", disabled=True)
+        # readonly nearest depot & distance
+        depots3 = auto.get("nearest_depots") or nearest_depots(auto["lat"], auto["lon"], n=3)
+        nearest = auto.get("nearest_depot") or (depots3[0] if depots3 else None)
+        cA, cB = st.columns([0.5, 0.5])
+        with cA:
+            st.text_input("Nearest depot", nearest["name"] if nearest else "n/a", disabled=True)
+        with cB:
+            st.text_input("Distance (miles)", f"{nearest['miles']:.1f} miles" if nearest else "—", disabled=True)
 
-        st.caption("Top 3 nearest depots (crow-fly)")
-        rows = [{"Depot": d["name"], "Distance (miles)": d["miles"]} for d in nd]
+        # Top-3 table (1,2,3; left-aligned; 1 decimal)
+        import pandas as pd
+        rows = [{"Depot": d["name"], "Distance (miles)": d["miles"]} for d in depots3]
         df = pd.DataFrame(rows)
-        df.index = range(1, len(df)+1)
+        df.index = range(1, len(df) + 1)
         df.index.name = ""
         df["Distance (miles)"] = df["Distance (miles)"].map(lambda x: f"{x:.1f}")
+        st.caption("Top 3 nearest depots (crow-fly)")
         st.table(df)
 
-        # --- Light route analysis preview (last 20 mi) with clickable issues ---
-        # Build route from nearest depot to site (OSRM)
-        route = osrm_route(
-            start_lon=next(d["lon"] for d in DEPOTS if d["name"]==nearest_name),
-            start_lat=next(d["lat"] for d in DEPOTS if d["name"]==nearest_name),
-            end_lon=auto["lon"], end_lat=auto["lat"]
-        )
-        cropped = crop_last_miles(route.get("coords", []), 20.0)
-        hazards = overpass_hazards_along(cropped, 35.0)
+        # Quick route snapshot (fast, cached)
+        if ROUTE_ANALYSIS_PREVIEW and nearest:
+            snap = quick_route_snapshot(
+                depot={"lat": nearest["lat"], "lon": nearest["lon"]},
+                site_lat=auto["lat"], site_lon=auto["lon"],
+            )
+            st.caption("Quick route snapshot (nearest depot)")
+            if snap:
+                m1, m2, m3 = st.columns(3)
+                with m1:
+                    st.metric("Driving distance", f"{snap['distance_mi']:.1f} mi")
+                with m2:
+                    st.metric("ETA (typical)", f"{snap['eta_min']:.0f} min")
+                with m3:
+                    st.metric("Last-mile winding", snap['winding'])
 
-        # Classify hazards for this vehicle
-        is_lpg = "LPG" in vehicle_type
-        issues = []
-        # compute mile-from-site for each hazard
-        latlon = [(c[1], c[0]) for c in cropped]
-        cum = cumulative_lengths_m(latlon) if latlon else [0.0]
-        for h in hazards:
-            sev, lab = classify_issue(h.get("tags",{}), veh_height_m, veh_width_m, VEHICLE_GVW_T.get(vehicle_type, 26), is_lpg)
-            # find nearest point along cropped to compute distance from site end
-            dmin = 1e12
-            if latlon:
-                for (a,b) in zip(latlon, latlon[1:]):
-                    dm = hav_m(h["lat"], h["lon"], a[0], a[1])
-                    if dm<dmin: dmin=dm
-            mile_from_site = (cum[-1] - dmin)/1609.34 if latlon else None
-            issues.append({"severity":sev,"label":lab,"lat":h["lat"],"lon":h["lon"],"mile":mile_from_site})
+                st.write(
+                    f"• Final approach via **{snap['final_road']}**; approach **{snap['approach_dir']}**."
+                )
+                if snap.get("tunnel_hint"):
+                    st.warning(snap["tunnel_hint"])
+                st.caption("Full, detailed route analysis appears after **Confirm & assess**.")
+            else:
+                st.caption("Routing service unavailable right now — will analyse after **Confirm & assess**.")
 
-        issues.sort(key=lambda x: (0 if x["severity"]=="BLOCKER" else 1, x["mile"] or 1e9))
-        st.markdown("#### Route analysis (last 20 miles)")
-        if route:
-            st.caption(f"Full route: {(route['distance_m']/1609.34):.1f} miles, {(route['duration_s']/60):.0f} min • Analysed segment: {( (cum[-1] if latlon else 0)/1609.34):.1f} miles (nearest to site)")
-        else:
-            st.caption("Analysed segment near site (OSRM route not fully available).")
-
-        if not issues:
-            st.info("No notable restrictions found on the last 20 miles.")
-        else:
-            # clickable Issue -> show inline popup map
-            for idx, it in enumerate(issues, start=1):
-                cols = st.columns([0.12, 0.40, 0.20, 0.28])
-                with cols[0]:
-                    st.write(f"**{idx}**")
-                with cols[1]:
-                    key_btn = f"iss_{idx}"
-                    if st.button(it["label"], key=key_btn):
-                        st.session_state[f"show_map_{key_btn}"] = not st.session_state.get(f"show_map_{key_btn}", False)
-                with cols[2]:
-                    st.write("**" + it["severity"] + "**")
-                with cols[3]:
-                    st.write(f"{(it['mile'] or 0):.1f} mi from site")
-
-                # inline popup map
-                if st.session_state.get(f"show_map_{key_btn}", False) and cropped:
-                    layer1 = pdk.Layer(
-                        "PathLayer",
-                        data=[{"path": [{"lon":c[0],"lat":c[1]} for c in cropped]}],
-                        get_path="path", get_width=4, width_min_pixels=2
-                    )
-                    layer2 = pdk.Layer(
-                        "ScatterplotLayer",
-                        data=[{"lat": it["lat"], "lon": it["lon"]}],
-                        get_position='[lon, lat]', get_radius=25, pickable=False
-                    )
-                    view = pdk.ViewState(latitude=it["lat"], longitude=it["lon"], zoom=14)
-                    st.pydeck_chart(pdk.Deck(layers=[layer1, layer2], initial_view_state=view, map_style="mapbox://styles/mapbox/light-v11"))
-
+        # Notes
         notes_txt = st.text_input("Notes (vegetation / sightlines / special instructions)", value="", key="notes_input")
 
+        # Submit the form
         submitted = st.form_submit_button("Confirm & assess", type="primary", key="confirm_btn")
 
+    # ---------------- After submit: compute risk, AI commentary, export ----------------
     if submitted:
         feats = {
             "building_m": building_m, "road_m": road_m, "drain_m": drain_m,
@@ -1181,14 +1134,6 @@ if auto:
                 fmt={"Length (m)": ".1f", "Width (m)": ".2f", "Height (m)": ".2f", "Turning circle (m)": ".1f"}
             )
 
-            # Recompute nearest depots for the record
-            nd = nearest_depots(auto["lat"], auto["lon"], 3)
-            st.markdown("#### Nearest depots")
-            df2 = pd.DataFrame([{"Depot": d["name"], "Distance (miles)": d["miles"]} for d in nd])
-            df2.index = range(1, len(df2)+1); df2.index.name=""
-            df2["Distance (miles)"] = df2["Distance (miles)"].map(lambda x: f"{x:.1f}")
-            st.table(df2)
-
             st.markdown("### Risk result")
             badge = ("✅ PASS" if risk.status=="PASS"
                      else "🟡 ATTENTION" if risk.status=="ATTENTION"
@@ -1204,48 +1149,12 @@ if auto:
                 if img:
                     st.image(img, caption="Map (centered on W3W)", use_container_width=True)
 
-        # ---------------- RIGHT: AI + Logistics & Routing (rich) ----------------
         with right:
-            # Build route + hazards again using nearest depot
-            nd = nearest_depots(auto["lat"], auto["lon"], 1)
-            nearest_name = nd[0]["name"]
-            dep_lon = next(d["lon"] for d in DEPOTS if d["name"]==nearest_name)
-            dep_lat = next(d["lat"] for d in DEPOTS if d["name"]==nearest_name)
-            route = osrm_route(dep_lon, dep_lat, auto["lon"], auto["lat"])
-            cropped = crop_last_miles(route.get("coords", []), 20.0)
-            hazards = overpass_hazards_along(cropped, 35.0)
-
-            is_lpg = "LPG" in vehicle_type
-            issues=[]
-            latlon=[(c[1],c[0]) for c in cropped] if cropped else []
-            cum=cumulative_lengths_m(latlon) if latlon else [0.0]
-            for h in hazards:
-                sev, lab = classify_issue(h.get("tags",{}), veh_height_m, veh_width_m, VEHICLE_GVW_T.get(vehicle_type,26), is_lpg)
-                dmin=1e12
-                if latlon:
-                    for a in latlon:
-                        dm = hav_m(h["lat"], h["lon"], a[0], a[1])
-                        if dm<dmin: dmin=dm
-                mile_from_site=(cum[-1]-dmin)/1609.34 if latlon else None
-                issues.append({"severity":sev,"label":lab,"lat":h["lat"],"lon":h["lon"],"mile":mile_from_site})
-            issues.sort(key=lambda x: (0 if x["severity"]=="BLOCKER" else 1, x["mile"] or 1e9))
-
-            # Route summary -> feed AI
-            flags_text = ", ".join([i["label"] for i in issues[:4]]) if issues else "none"
-            route_summary = {
-                "nearest_depot": nearest_name,
-                "nearest_depot_miles": f"{nd[0]['miles']:.1f}",
-                "full_miles": f"{(route.get('distance_m',0)/1609.34):.1f}" if route else "n/a",
-                "last20_mi_issue_count": len(issues),
-                "flags_text": flags_text,
-            }
-
             st.markdown("### AI commentary")
             ctx = {
                 "feats": feats, "wind": wind, "slope_pct": slope_pct,
                 "enclosure_sides": enclosure_sides, "los_issue": los_issue,
-                "veg_3m": veg_3m, "risk": risk,
-                "route_summary": route_summary,
+                "veg_3m": veg_3m, "risk": risk
             }
             ai = ai_sections(ctx)
             sections = [
@@ -1258,58 +1167,29 @@ if auto:
                 with st.expander(f"[{i}] {k}", expanded=(i == 1)):
                     st.write(ai[k])
 
-            st.markdown("### Logistics & Routing")
-            if route and cropped:
-                # Big map
-                layer_route = pdk.Layer(
-                    "PathLayer",
-                    data=[{"path":[{"lon":c[0],"lat":c[1]} for c in route["coords"]]}],
-                    get_path="path", get_width=5, width_min_pixels=2
-                )
-                layer_last20 = pdk.Layer(
-                    "PathLayer",
-                    data=[{"path":[{"lon":c[0],"lat":c[1]} for c in cropped]}],
-                    get_path="path", get_width=7, width_min_pixels=3
-                )
-                layer_issues = pdk.Layer(
-                    "ScatterplotLayer",
-                    data=[{"lon":i["lon"],"lat":i["lat"]} for i in issues],
-                    get_position='[lon, lat]', get_radius=35
-                )
-                view = pdk.ViewState(latitude=auto["lat"], longitude=auto["lon"], zoom=9)
-                st.pydeck_chart(pdk.Deck(layers=[layer_route,layer_last20,layer_issues], initial_view_state=view, map_style="mapbox://styles/mapbox/light-v11"))
-
-                st.caption(f"Depot: {nearest_name} • Route: {(route['distance_m']/1609.34):.1f} miles, {(route['duration_s']/60):.0f} min • Analysed: {(cumulative_lengths_m([(c[1],c[0]) for c in cropped])[-1]/1609.34):.1f} miles")
-            else:
-                st.info("Route overview not available.")
-
-            if issues:
-                st.markdown("#### Last 20 miles — key restrictions")
-                df_iss = pd.DataFrame(
-                    [{"Severity":i["severity"], "Issue":i["label"], "Mile from site": f"{(i['mile'] or 0):.1f}"} for i in issues]
-                )
-                df_iss.index = range(1, len(df_iss)+1); df_iss.index.name=""
-                st.table(df_iss)
-            else:
-                st.write("No notable restrictions detected.")
+            st.markdown("### Recommended controls")
+            controls_list = [
+                "Use a trained banksman during manoeuvres and reversing.",
+                "Add temporary cones/signage; consider a convex mirror or visibility aids.",
+                "Plan approach/egress to avoid reversing where practicable.",
+            ]
+            if stand_surface in ("gravel", "grass"):
+                controls_list.append("Ensure firm, level stand surface (temporary mats if required).")
+            if overhead_m is not None and overhead_m < CoP["overhead_info_m"]:
+                controls_list.append("Confirm isolation/clearance for overhead power; position tanker outside bands.")
+            for b in controls_list:
+                st.write("• " + b)
 
             st.markdown("---")
             st.subheader("Access suitability (vehicle vs restrictions)")
-            if stand_surface in ("asphalt", "concrete", "block paving") and turning_circle_m <= 22.0 and not any(i["severity"]=="BLOCKER" for i in issues):
-                st.success("PASS — route and stand look serviceable for the selected vehicle.")
+            if stand_surface in ("asphalt", "concrete", "block paving") and turning_circle_m <= 22.0:
+                st.success("PASS — no blocking restrictions detected for the selected vehicle.")
             else:
-                msgs=[]
-                if stand_surface not in ("asphalt","concrete","block paving"):
-                    msgs.append("stand surface")
-                if turning_circle_m>22.0:
-                    msgs.append("turning area")
-                if any(i["severity"]=="BLOCKER" for i in issues):
-                    msgs.append("route blockers")
-                st.info("ATTENTION — check " + ", ".join(msgs) + ".")
+                st.info("ATTENTION — check turning area / bearing capacity for the selected vehicle.")
 
             # ---------- PDF export ----------
             st.markdown("### Export")
-            st.caption("Generate a one-page PDF summary (key metrics, separations, vehicle, AI commentary, route summary, controls, and map if available).")
+            st.caption("Generate a one-page PDF summary (includes key metrics, separations, vehicle, AI commentary, controls, and map if available).")
 
             map_path = None
             if MAPBOX_TOKEN:
@@ -1407,7 +1287,7 @@ if auto:
                 # Separations
                 header("Separations (~400 m)", size=13)
                 feats = ctx["feats"]
-                for l in [
+                sep_lines = [
                     f"Building: {feats.get('building_m','n/a')}",
                     f"Boundary: {feats.get('boundary_m','n/a')}",
                     f"Road/footpath: {feats.get('road_m','n/a')}",
@@ -1416,20 +1296,14 @@ if auto:
                     f"Railway: {feats.get('rail_m','n/a')}",
                     f"Watercourse: {feats.get('water_m','n/a')}",
                     f"Land use: {feats.get('land_class','n/a')}",
-                ]: text_line(l)
+                ]
+                for l in sep_lines: text_line(l)
 
                 # Risk
                 header("Risk score", size=13)
                 text_line(f"Total: {ctx['risk'].score:.1f}/100 → {ctx['risk'].status}", bold=True)
                 for p, m in ctx['risk'].explain[:7]:
                     text_line(f"+{p} {m}")
-
-                # Route summary
-                rs = ctx.get("route_summary", {})
-                header("Logistics & Route", size=13)
-                text_line(f"Depot: {rs.get('nearest_depot','n/a')}  |  Depot distance: {rs.get('nearest_depot_miles','n/a')} mi", col=grey)
-                text_line(f"Route length: {rs.get('full_miles','n/a')} mi", col=grey)
-                wrap_paragraph("Last 20 mi flags: " + (rs.get("flags_text","none") or "none"))
 
                 # Controls
                 header("Recommended controls", size=13)
@@ -1451,19 +1325,6 @@ if auto:
                 c.save()
                 return buf.getvalue()
 
-            # Controls
-            controls_list = [
-                "Use a trained banksman during manoeuvres and reversing.",
-                "Add temporary cones/signage; consider a convex mirror or visibility aids.",
-                "Plan approach/egress to avoid reversing where practicable.",
-            ]
-            if stand_surface in ("gravel", "grass"):
-                controls_list.append("Ensure firm, level stand surface (temporary mats if required).")
-            if overhead_m is not None and overhead_m < CoP["overhead_info_m"]:
-                controls_list.append("Confirm isolation/clearance for overhead power; position tanker outside bands.")
-            if any(i["label"].lower().startswith("tunnel") for i in issues):
-                controls_list.append("Re-route to avoid tunnels; LPG tankers prohibited in tunnels.")
-
             ctx_pdf = {
                 "addr": addr_edited,
                 "wind": wind,
@@ -1481,12 +1342,6 @@ if auto:
                     "turning_circle_m": turning_circle_m,
                 },
                 "controls": controls_list,
-                "route_summary": {
-                    "nearest_depot": nearest_name,
-                    "nearest_depot_miles": f"{nearest_depots(auto['lat'],auto['lon'],1)[0]['miles']:.1f}",
-                    "full_miles": f"{(route.get('distance_m',0)/1609.34):.1f}" if route else "n/a",
-                    "flags_text": ", ".join([i["label"] for i in issues[:6]]) if issues else "none",
-                }
             }
 
             pdf_bytes = build_pdf_bytes(ctx_pdf, ai, controls_list, map_path)
