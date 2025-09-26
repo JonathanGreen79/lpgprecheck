@@ -1048,19 +1048,19 @@ def build_pdf_report(ctx: Dict) -> bytes:
         story += [tank_im, Spacer(1, 3*mm)]
 
     # ---------- KEY METRICS ----------
-    story.apend [_title("Key metrics")]
-    story.apend _kv_table(ctx.get("key_metrics", {}))
-    story.apend [Spacer(1, 3*mm)]
-
+    story.append(_title("Key metrics"))
+    story.append(_kv_table(ctx.get("key_metrics", {})))
+    story.append(Spacer(1, 3*mm))
+    
     # ---------- SEPARATIONS ----------
-    story.apend [_title("Separations (~400 m)")]
-    story.apend _kv_table(ctx.get("separations", {}))
-    story.apend [Spacer(1, 3*mm)]
-
+    story.append(_title("Separations (~400 m)"))
+    story.append(_kv_table(ctx.get("separations", {})))
+    story.append(Spacer(1, 3*mm))
+    
     # ---------- VEHICLE ----------
-    story.apend [_title("Vehicle")]
-    story.apend _kv_table(ctx.get("vehicle", {}))
-    story.apend [Spacer(1, 3*mm)]
+    story.append(_title("Vehicle"))
+    story.append(_kv_table(ctx.get("vehicle", {})))
+    story.append(Spacer(1, 3*mm))
 
     # ---------- NEAREST DEPOTS ----------
     dep3 = ctx.get("nearest_depots") or []
@@ -2002,6 +2002,7 @@ if auto:
                         )
                     else:
                         st.info("No vehicle-specific conflicts detected in the analysed segment.")
+
 
 
 
